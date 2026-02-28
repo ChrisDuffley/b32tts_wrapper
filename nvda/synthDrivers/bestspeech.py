@@ -133,7 +133,7 @@ class SynthDriver(SynthDriver):
 		self.numberProcessing = False
 		self.abbreviations = True
 		self._phrasePrediction = True
-		self.table = str.maketrans("'", "\u2019")
+		self.table = str.maketrans("\u2019", "'")
 		self.canceled = False
 
 	def _start_helper(self):
