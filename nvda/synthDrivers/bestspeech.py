@@ -116,7 +116,7 @@ class SynthDriver(SynthDriver):
 			self.dll.bst_speak_async.restype = c_void_p
 			self.handle = self.dll.bst_init_w(path)
 			self._use_helper = False
-		except OSError:
+		except (OSError, AttributeError):
 			# b32_wrapper.dll could not be loaded in-process (e.g. 32-bit DLL in
 			# 64-bit NVDA 2026+, or DLL simply absent). Fall back to the
 			# out-of-process 32-bit helper.
