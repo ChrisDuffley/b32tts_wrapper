@@ -142,7 +142,8 @@ class SynthDriver(SynthDriver):
 			[helper_path, self._dll_path],
 			stdin=subprocess.PIPE,
 			stdout=subprocess.PIPE,
-			stderr=subprocess.DEVNULL
+			stderr=subprocess.DEVNULL,
+			creationflags=subprocess.CREATE_NO_WINDOW
 		)
 
 	def loadSettings(self, onlyChanged = False):
