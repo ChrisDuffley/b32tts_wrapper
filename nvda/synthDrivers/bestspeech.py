@@ -237,11 +237,18 @@ class SynthDriver(SynthDriver):
 			pass
 		except Exception:
 			log.error("Failed to load bestspeech language profiles", exc_info=True)
-		self._initEngine()
 		global bgQueue
 		bgQueue = queue.Queue()
 		self.bgThread = BgThread()
 		self.bgThread.start()
+		# The engine must be initialized on the background speech thread, never here on
+		# NVDA's main thread: in-process, the classic engine creates its buffer-release
+		# message window on whichever thread first synthesizes (the init warmup), and if
+		# that isn't the thread all later synthesis runs on, release messages get
+		# dispatched cross-thread by NVDA's own message loop, corrupting engine state
+		# and crashing NVDA (observed on 32-bit NVDA 2025.3). Speech requests queue up
+		# behind this task, so ordering is preserved.
+		_execWhenDone(self._initEngine, mustBeAsync=True)
 		self.rate = 90
 		self.volume = self._paramToPercent(0, minVolume, maxVolume)
 		self.voice = "fred" # This will automatically set all other parameters like pitch, inflection, excitation and more.
