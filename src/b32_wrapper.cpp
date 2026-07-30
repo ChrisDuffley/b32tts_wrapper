@@ -36,14 +36,9 @@ const char* bst_voice_data[] = {
 int bst_voice_count = 0; // Will be initialized upon first call to bst_voices or bst_init.
 const char** bst_voices_buf = nullptr; // Contains pointers to voice names (populated in bst_voices call).
 
-// Function typedefs. First starting with the bestspeech definitions collected by Rommix, then moving on to the waveout definitions.
-typedef int  (__cdecl *bstCreateFunc)(long*&);
-typedef int  (__cdecl *TtsWavFunc)(long*, void*, const char*);
-typedef void (__cdecl *bstRelBufFunc)(long*);
-typedef void (__cdecl *bstCloseFunc)(long*);
-typedef void (__cdecl *bstDestroyFunc)();
-typedef void (__cdecl *bstSetParamsFunc)(long*, int, int);
-typedef void (__cdecl *bstGetParamsFunc)(long*, int, int*);
+// The bst_state structure and engine function typedefs live in b32_state.h so that
+// b32_v2.cpp can share them. Below are the waveout definitions used by the hooks.
+#include "b32_state.h"
 typedef MMRESULT  (WINAPI *waveOutOpenFunc)(LPHWAVEOUT, UINT, LPCWAVEFORMATEX, DWORD_PTR, DWORD_PTR, DWORD);
 waveOutOpenFunc waveOutOpenProc;
 typedef MMRESULT  (WINAPI *waveOutHeaderFunc)(HWAVEOUT, WAVEHDR*, UINT);
@@ -53,27 +48,8 @@ waveOutHeaderFunc waveOutUnprepareHeaderProc;
 typedef MMRESULT  (WINAPI *waveOutResetFunc)(HWAVEOUT);
 waveOutResetFunc waveOutResetProc;
 waveOutResetFunc waveOutCloseProc;
-
-// This structure contains all state information required to use bestspeech, including the dll module handle, required bst function pointers and the bestspeak handle itself.
-struct bst_state {
-	HMODULE dll;
-	long* tts;
-	bstCreateFunc bstCreate;
-	TtsWavFunc TtsWav;
-	bstRelBufFunc bstRelBuf;
-	bstCloseFunc bstClose;
-	bstDestroyFunc bstDestroy;
-	bstSetParamsFunc bstSetParams;
-	bstGetParamsFunc bstGetParams;
-	bst_async_callback async_callback;
-	void* async_callback_user;
-	bool async_stop_speaking;
-	char* audio;
-	long audio_size;
-	long audio_capacity;
-	HWND message_window;
-	sonicStream sonic_stream;
-};
+typedef void (WINAPI *sleepFunc)(DWORD);
+sleepFunc sleepProc;
 
 bool winmm_hooked = false;
 thread_local bst_state* winmm_hooked_state = nullptr; // Insure that we can passthrough any hooked waveout calls that come through on a thread or context other than the one we are working on while providing global access to the speech state within hooks.
@@ -107,9 +83,15 @@ b32w_export BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 }
 
 // Actual waveout hooks, most of these are no-ops/passthroughs accept for open and write. The no-ops must still exist to insure that no unwanted function calls from bestspeech reach the WinMM API.
+// The classic engine passes our state pointer through TtsWav's window argument which arrives here as the callback, giving us a precise ownership check. The v2 dlls open with CALLBACK_NULL, so for those we claim any waveOutOpen made on the thread we're currently synthesizing on (winmm_hooked_state is thread_local, so genuine waveout use on other threads still passes through).
 MMRESULT WINAPI waveOutOpenHook(LPHWAVEOUT outptr, UINT device, LPCWAVEFORMATEX format, DWORD_PTR callback, DWORD_PTR instance, DWORD flags) {
-	if (!winmm_hooked_state || (bst_state*)callback != winmm_hooked_state) return waveOutOpenProc(outptr, device, format, callback, instance, flags);
-	*outptr = (HWAVEOUT)callback; // Now all other hooks will receive state information in their first parameter, though we prefer to use winmm_hooked_state. This also makes sure our hook returns a semblance of what the calling function is expecting.
+	if (!winmm_hooked_state || ((bst_state*)callback != winmm_hooked_state && !winmm_hooked_state->is_v2)) return waveOutOpenProc(outptr, device, format, callback, instance, flags);
+	*outptr = (HWAVEOUT)winmm_hooked_state; // Now all other hooks will receive state information in their first parameter, though we prefer to use winmm_hooked_state. This also makes sure our hook returns a semblance of what the calling function is expecting.
+	winmm_hooked_state->sample_rate = format->nSamplesPerSec;
+	// Now that the true output format is known, bring the sonic stream in line with it. The v2 language dlls don't all share one sample rate, so this can't be hardcoded.
+	if (winmm_hooked_state->sonic_stream && sonicGetSampleRate(winmm_hooked_state->sonic_stream) != (int)format->nSamplesPerSec) sonicSetSampleRate(winmm_hooked_state->sonic_stream, format->nSamplesPerSec);
+	if (!winmm_hooked_state->sonic_stream && winmm_hooked_state->pending_rate_multiplier != 1.0f) winmm_hooked_state->sonic_stream = sonicCreateStream(format->nSamplesPerSec, 1);
+	if (winmm_hooked_state->sonic_stream) sonicSetSpeed(winmm_hooked_state->sonic_stream, winmm_hooked_state->pending_rate_multiplier);
 	if (!winmm_hooked_state->audio && !winmm_hooked_state->async_callback) {
 		winmm_hooked_state->audio = (char*)malloc(winmm_hooked_state->audio_capacity);
 		if (winmm_hooked_state->audio_size) make_wav_header_in_place((wav_header*)winmm_hooked_state->audio, 0, format->nSamplesPerSec, format->wBitsPerSample, format->nChannels, format->wFormatTag);
@@ -129,7 +111,8 @@ inline void waveOutput(short* data, DWORD data_len) {
 		}
 	} else {
 		if (winmm_hooked_state->audio_size + data_len >= winmm_hooked_state->audio_capacity) {
-			winmm_hooked_state->audio_capacity *= 2;
+			// Must keep doubling until the chunk fits; v2 dlls deliver a whole utterance in one write, which can be many times the current capacity.
+			while (winmm_hooked_state->audio_size + data_len >= winmm_hooked_state->audio_capacity) winmm_hooked_state->audio_capacity *= 2;
 			winmm_hooked_state->audio = (char*)realloc(winmm_hooked_state->audio, winmm_hooked_state->audio_capacity);
 		}
 		memcpy(winmm_hooked_state->audio + winmm_hooked_state->audio_size, data, data_len);
@@ -138,7 +121,11 @@ inline void waveOutput(short* data, DWORD data_len) {
 }
 MMRESULT WINAPI waveOutWriteHook(HWAVEOUT ptr, WAVEHDR* header, UINT size) {
 	if (!winmm_hooked_state || (bst_state*)ptr != winmm_hooked_state) return waveOutWriteProc(ptr, header, size);
-	PostMessage(winmm_hooked_state->message_window, WM_REL_BUF, 0, 0);
+	if (winmm_hooked_state->is_v2) {
+		// The v2 dlls have no bstRelBuf; they just want the header marked played.
+		header->dwFlags |= WHDR_DONE;
+		header->dwFlags &= ~WHDR_INQUEUE;
+	} else PostMessage(winmm_hooked_state->message_window, WM_REL_BUF, 0, 0);
 	if (winmm_hooked_state->async_stop_speaking) return MMSYSERR_NOERROR; // Callback returned false, drop all remaining buffers.
 	short* data = (short*)header->lpData;
 	DWORD data_len = header->dwBufferLength;
@@ -166,6 +153,11 @@ MMRESULT WINAPI waveOutCloseHook(HWAVEOUT ptr) {
 	}
 	return MMSYSERR_NOERROR;
 }
+// After writing an utterance's single buffer, a v2 dll sleeps out the audio's entire real time playback duration before Say_TTS returns. Since our write hook consumes the audio instantly, that nap is pure added latency (5+ seconds for a paragraph); skip it. This only fires on the synthesis thread while a v2 utterance is in progress, so the engine's short internal waits and every other caller of Sleep in the process remain untouched.
+void WINAPI sleepHook(DWORD ms) {
+	if (winmm_hooked_state && winmm_hooked_state->is_v2 && ms >= 100) return;
+	sleepProc(ms);
+}
 
 void winmm_hook() {
 	if (winmm_hooked) return;
@@ -176,6 +168,7 @@ void winmm_hook() {
 	MH_CreateHook((LPVOID)waveOutUnprepareHeader, (LPVOID)waveOutUnprepareHeaderHook, (LPVOID*)&waveOutUnprepareHeaderProc);
 	MH_CreateHook((LPVOID)waveOutReset, (LPVOID)waveOutResetHook, (LPVOID*)&waveOutResetProc);
 	MH_CreateHook((LPVOID)waveOutClose, (LPVOID)waveOutCloseHook, (LPVOID*)&waveOutCloseProc);
+	MH_CreateHook((LPVOID)Sleep, (LPVOID)sleepHook, (LPVOID*)&sleepProc);
 	MH_EnableHook(MH_ALL_HOOKS);
 	winmm_hooked = TRUE;
 }
@@ -199,6 +192,7 @@ inline bst_state* bst_init_from_hmodule(HMODULE hmod) {
 	if (!hmod) return nullptr;
 	voices_count();
 	bst_state* s = (bst_state*)malloc(sizeof(bst_state));
+	memset(s, 0, sizeof(bst_state));
 	s->dll = hmod;
 	s->bstCreate = (bstCreateFunc)GetProcAddress(s->dll, "bstCreate");
 	s->TtsWav = (TtsWavFunc)GetProcAddress(s->dll, "TtsWav");
@@ -207,10 +201,18 @@ inline bst_state* bst_init_from_hmodule(HMODULE hmod) {
 	s->bstClose = (bstCloseFunc)GetProcAddress(s->dll, "bstClose");
 	s->bstSetParams = (bstSetParamsFunc)GetProcAddress(s->dll, "bstSetParams");
 	s->bstGetParams = (bstGetParamsFunc)GetProcAddress(s->dll, "bstGetParams");
-	s->audio = nullptr;
 	s->message_window = nullptr; // We'll create this in the speak function encase the user calls speak on another thread from init.
 	s->sonic_stream = nullptr; // We'll create this the first time a rate multiplier is applied.
-	if (!s->bstCreate || !s->TtsWav || s->bstCreate(s->tts)) {
+	s->sample_rate = 11025;
+	s->pending_rate_multiplier = 1.0f;
+	if (!s->bstCreate || !s->TtsWav) {
+		// Not a classic engine; try the 2006 language dll interface before giving up.
+		if (bst_v2_setup(s)) return s;
+		FreeLibrary(s->dll);
+		free(s);
+		return nullptr;
+	}
+	if (s->bstCreate(s->tts)) {
 		FreeLibrary(s->dll);
 		free(s);
 		return nullptr;
@@ -227,29 +229,52 @@ b32w_export bst_state* bst_init_w(const wchar_t* module_path) {
 b32w_export void bst_free(bst_state* s) {
 	if (!s) return;
 	if (s->sonic_stream) sonicDestroyStream(s->sonic_stream);
-	s->bstClose(s->tts);
-	s->bstDestroy();
+	if (s->is_v2) bst_v2_close(s);
+	else {
+		s->bstClose(s->tts);
+		s->bstDestroy();
+	}
 	FreeLibrary(s->dll);
-	DestroyWindow(s->message_window);
+	if (s->message_window) DestroyWindow(s->message_window);
 	free(s);
 }
 inline void bst_speak_internal(bst_state* s, const char* text, int voice, int rate, float rate_multiplier, int gain) {
-	if (!s->message_window) s->message_window = create_message_window();
-	if (rate_multiplier != 1.0 && !s->sonic_stream) s->sonic_stream = sonicCreateStream(11025, 1);
-	if (voice >= 0 && voice < bst_voice_count) { // prepend voice prefixes
-		int text_len = strlen(bst_voice_data[voice * 3 + 1]) + strlen(bst_voice_data[voice * 3 + 2]) + strlen(text) + 1;
-		char* actual_text = (char*)malloc(text_len);
-		_snprintf(actual_text, text_len, "%s%s%s", bst_voice_data[voice * 3 + 1], bst_voice_data[voice * 3 + 2], text);
-		text = actual_text;
-	}
-	s->bstSetParams(s->tts, BST_RATE_SETTING, rate * -1); // Bestspeech interprets lower numbers as faster rates.
-	s->bstSetParams(s->tts, BST_GAIN_SETTING, gain);
+	if (!s->is_v2 && !s->message_window) s->message_window = create_message_window();
+	s->pending_rate_multiplier = rate_multiplier; // For v2 the sonic stream is created in waveOutOpenHook where the dll's true sample rate is first known.
+	if (!s->is_v2 && rate_multiplier != 1.0f && !s->sonic_stream) s->sonic_stream = sonicCreateStream(11025, 1);
 	if (s->sonic_stream) sonicSetSpeed(s->sonic_stream, rate_multiplier);
+	bool text_allocated = false;
+	if (s->is_v2) {
+		// No bstSetParams here; the v2 frontend still parses inline tilde commands, so express rate and gain that way. Rate is negated to preserve this API's higher-is-faster convention (the engine itself interprets lower numbers as faster).
+		char params[64] = "";
+		if (rate != 0) _snprintf(params, sizeof(params), "~r%d]", rate * -1);
+		if (gain != 0) _snprintf(params + strlen(params), sizeof(params) - strlen(params), "~g%d]", gain);
+		const char* prefix1 = voice >= 0 && voice < bst_voice_count? bst_voice_data[voice * 3 + 1] : "";
+		const char* prefix2 = voice >= 0 && voice < bst_voice_count? bst_voice_data[voice * 3 + 2] : "";
+		if (params[0] || prefix1[0]) {
+			int text_len = strlen(params) + strlen(prefix1) + strlen(prefix2) + strlen(text) + 1;
+			char* actual_text = (char*)malloc(text_len);
+			_snprintf(actual_text, text_len, "%s%s%s%s", prefix1, prefix2, params, text);
+			text = actual_text;
+			text_allocated = true;
+		}
+	} else {
+		if (voice >= 0 && voice < bst_voice_count) { // prepend voice prefixes
+			int text_len = strlen(bst_voice_data[voice * 3 + 1]) + strlen(bst_voice_data[voice * 3 + 2]) + strlen(text) + 1;
+			char* actual_text = (char*)malloc(text_len);
+			_snprintf(actual_text, text_len, "%s%s%s", bst_voice_data[voice * 3 + 1], bst_voice_data[voice * 3 + 2], text);
+			text = actual_text;
+			text_allocated = true;
+		}
+		s->bstSetParams(s->tts, BST_RATE_SETTING, rate * -1); // Bestspeech interprets lower numbers as faster rates.
+		s->bstSetParams(s->tts, BST_GAIN_SETTING, gain);
+	}
 	winmm_hook();
 	winmm_hooked_state = s;
-	s->TtsWav(s->tts, s, text);
+	if (s->is_v2) bst_v2_speak(s, text);
+	else s->TtsWav(s->tts, s, text);
 	winmm_hooked_state = nullptr;
-	if (voice >= 0 && voice < bst_voice_count) free((void*)text); // We've allocated a custom string in this case.
+	if (text_allocated) free((void*)text);
 }
 b32w_export char* bst_speak(bst_state* s, long* size, const char* text, int voice, int rate, float rate_multiplier, int gain, bool pcm_header) {
 	if (!s || !text) return nullptr;
@@ -278,4 +303,11 @@ b32w_export void bst_speak_async(bst_state* s, bst_async_callback callback, void
 }
 b32w_export void bst_speech_free(char* data) {
 	free(data);
+}
+b32w_export int bst_get_sample_rate(bst_state* s) {
+	if (!s) return 0;
+	return s->sample_rate;
+}
+b32w_export bool bst_is_v2(bst_state* s) {
+	return s && s->is_v2;
 }

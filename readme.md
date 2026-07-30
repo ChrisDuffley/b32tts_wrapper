@@ -9,6 +9,21 @@ This project negates the aformentioned issue by actually hooking the waveOut fun
 
 Bestspeech outputs audio in 16 bit 11025hz mono pcm.
 
+## Language support
+
+In addition to the classic 1994 b32_tts.dll, the wrapper can load the stripped down 2006 "v2" builds of BeSTspeech which shipped with Lingvosoft Talking Dictionary products and were preserved by Rommix. These come as one dll per language (dll_eng.dll, dll_fre.dll, dll_ger.dll, dll_spa.dll, dll_ita.dll, dll_por.dll, dll_dut.dll, dll_pol.dll, dll_rus.dll, dll_gre.dll, dll_heb.dll, dll_ara.dll, dll_jpn.dll) and accept unicode text, which is what makes the non Latin scripts work. The wrapper detects which flavor of dll it was given from the dll's exports, so you simply pass a v2 dll path to bst_init where you'd normally pass b32_tts.dll.
+
+A few things to be aware of with the v2 dlls:
+
+* Text passed to the speak functions is interpreted as utf-8 for v2 dlls, unlike the classic engine which takes windows-1252 bytes verbatim.
+* The output sample rate varies per language (usually 10000hz, but Russian is 10800hz). Call bst_get_sample_rate after synthesizing to learn the true rate rather than assuming 11025.
+* There is no parameter interface in these builds, but the text frontend still understands the inline tilde commands (~r for rate, ~f for pitch and friends), which is how the wrapper and the NVDA addon apply settings to them.
+* The v2 dlls have a quirk where after synthesizing an utterance they blindly sleep for the audio's entire real time duration. The wrapper hooks Sleep and skips that nap on the synthesis thread, so speaking through them is just as instant as the classic engine.
+
+The command line utility grew a matching -d switch to select the engine dll, for example ```b32_spk -dC:\path\to\dll_ger.dll -t"Guten Tag!" -fout.wav```
+
+The NVDA addon exposes all of this as a Language combo box in the synthesizer settings dialog. Copy any v2 language dlls you have into the addon's synthDrivers folder (next to b32_tts.dll) and they will appear in the list alongside Classic English, which remains the default. Voices, rate boost and the other settings work on every language.
+
 ## How to build?
 This project uses the SCons build system. If you have scons and a c++ compiler installed and on your path, you can just run scons -s in the root of this project to generate a .dll wrapper, a test program and a statically linked high level command line utility. Prebuilt binaries are provided on the releases page, or you can fork the repository and run the build action.
 
@@ -65,6 +80,16 @@ This version of the speak function allows your application to receive audio data
 ```void bst_speech_free(char* data);```
 
 Call this to free any data returned by bst_speak. Do not use this within the context of bst_speak_async.
+
+
+```int bst_get_sample_rate(bst_state* s);```
+
+Returns the engine's output sample rate in hz. The classic engine is always 11025. The v2 language dlls vary per language (usually 10000, 10800 for Russian), and the value is only exact after the first utterance has been synthesized, so consider synthesizing a short throwaway utterance right after init if you need the rate up front.
+
+
+```bool bst_is_v2(bst_state* s);```
+
+Returns true if the loaded dll is a 2006 v2 language dll rather than the classic engine.
 
 
 ## Notes

@@ -1,6 +1,7 @@
 import os
 import struct
 import subprocess
+from collections import OrderedDict
 from synthDriverHandler import SynthDriver, synthIndexReached, synthDoneSpeaking, VoiceInfo
 from speech.commands import IndexCommand, PitchCommand, CharacterModeCommand
 import ctypes
@@ -43,6 +44,28 @@ voices = {
 	"tim": {"headsize": "3", "excitation": "4", "inflection": -10, "unvoicedVolume": 0, "pitch": 60}
 }
 
+# Available engine languages. "classic" is the original 1994 b32_tts.dll this addon has
+# always used; the rest are the 2006 "v2" language dlls (from the Lingvosoft era, preserved
+# by Rommix) which take utf-8 text and vary in output sample rate. Each entry is:
+# language id -> (display label, dll filename, NVDA language code, text encoding).
+# Only languages whose dll actually exists in this directory are offered in the dialog.
+languages = OrderedDict([
+	("classic", ("Classic English (1994)", "b32_tts.dll", "en", "windows-1252")),
+	("eng", ("English", "dll_eng.dll", "en", "utf-8")),
+	("ara", ("Arabic", "dll_ara.dll", "ar", "utf-8")),
+	("dut", ("Dutch", "dll_dut.dll", "nl", "utf-8")),
+	("fre", ("French", "dll_fre.dll", "fr", "utf-8")),
+	("ger", ("German", "dll_ger.dll", "de", "utf-8")),
+	("gre", ("Greek", "dll_gre.dll", "el", "utf-8")),
+	("heb", ("Hebrew", "dll_heb.dll", "he", "utf-8")),
+	("ita", ("Italian", "dll_ita.dll", "it", "utf-8")),
+	("jpn", ("Japanese", "dll_jpn.dll", "ja", "utf-8")),
+	("pol", ("Polish", "dll_pol.dll", "pl", "utf-8")),
+	("por", ("Portuguese", "dll_por.dll", "pt", "utf-8")),
+	("rus", ("Russian", "dll_rus.dll", "ru", "utf-8")),
+	("spa", ("Spanish", "dll_spa.dll", "es", "utf-8")),
+])
+
 bst_async_callback = CFUNCTYPE(c_long, c_void_p, c_long, c_void_p)
 
 # The BGThread from espeak
@@ -76,6 +99,7 @@ class SynthDriver(SynthDriver):
 	name = 'bestspeech'
 	description = 'Bestspeech'
 	supportedSettings = (
+		DriverSetting("bstLanguage", "&Language", availableInSettingsRing=True),
 		SynthDriver.VoiceSetting(),
 		SynthDriver.RateSetting(),
 		SynthDriver.RateBoostSetting(),
@@ -98,31 +122,22 @@ class SynthDriver(SynthDriver):
 
 	def __init__(self):
 		super().__init__()
-		path = os.path.join(os.path.dirname(__file__), 'b32_tts.dll')
-		wrapper_path = os.path.join(os.path.dirname(__file__), 'b32_wrapper.dll')
-		self._dll_path = path
+		self._basePath = os.path.dirname(__file__)
 		self.player = None
-		try:
-			currentSoundcardOutput = config.conf['speech']['outputDevice']
-		except:
-			currentSoundcardOutput = config.conf["audio"]["outputDevice"]
-		self.player = nvwave.WavePlayer(1, 11025, 16, outputDevice=currentSoundcardOutput)
 		self._helper = None
-		try:
-			self.dll = ctypes.cdll[wrapper_path]
-			self.dll.bst_init_w.argtypes = (ctypes.c_wchar_p,)
-			self.dll.bst_init_w.restype = c_void_p
-			self.dll.bst_free.argtypes = (c_void_p,)
-			self.dll.bst_speak_async.restype = c_void_p
-			self.handle = self.dll.bst_init_w(path)
-			self._use_helper = False
-		except (OSError, AttributeError):
-			# b32_wrapper.dll could not be loaded in-process (e.g. 32-bit DLL in
-			# 64-bit NVDA 2026+, or DLL simply absent). Fall back to the
-			# out-of-process 32-bit helper.
-			self.dll = None
-			self._use_helper = True
-			self._start_helper()
+		self.dll = None
+		self.handle = None
+		self._use_helper = False
+		# Only offer languages whose engine dll is actually present next to this driver.
+		self._availableBstLanguages = OrderedDict()
+		for langId, (label, dllName, nvdaLang, encoding) in languages.items():
+			if os.path.isfile(os.path.join(self._basePath, dllName)):
+				self._availableBstLanguages[langId] = StringParameterInfo(langId, label)
+		if not self._availableBstLanguages:
+			# Nothing found; keep the classic entry so init proceeds (and fails loudly) the same way older addon versions did.
+			self._availableBstLanguages["classic"] = StringParameterInfo("classic", languages["classic"][0])
+		self._bstLanguage = "classic" if "classic" in self._availableBstLanguages else next(iter(self._availableBstLanguages))
+		self._initEngine()
 		global bgQueue
 		bgQueue = queue.Queue()
 		self.bgThread = BgThread()
@@ -136,8 +151,61 @@ class SynthDriver(SynthDriver):
 		self.table = str.maketrans("\u2019", "'")
 		self.canceled = False
 
+	def _initEngine(self):
+		# (Re)starts the engine for the currently selected language, either in-process or
+		# via the 32-bit helper, then creates a player matching the engine's sample rate.
+		label, dllName, nvdaLang, encoding = languages[self._bstLanguage]
+		self._dll_path = os.path.join(self._basePath, dllName)
+		self._encoding = encoding
+		wrapper_path = os.path.join(self._basePath, 'b32_wrapper.dll')
+		sampleRate = None
+		try:
+			if self.dll is None:
+				self.dll = ctypes.cdll[wrapper_path]
+				self.dll.bst_init_w.argtypes = (ctypes.c_wchar_p,)
+				self.dll.bst_init_w.restype = c_void_p
+				self.dll.bst_free.argtypes = (c_void_p,)
+				self.dll.bst_speak_async.restype = c_void_p
+				self.dll.bst_speak.argtypes = (c_void_p, POINTER(c_long), c_char_p, c_long, c_long, c_float, c_long, ctypes.c_bool)
+				self.dll.bst_speak.restype = c_void_p
+				self.dll.bst_speech_free.argtypes = (c_void_p,)
+				self.dll.bst_get_sample_rate.argtypes = (c_void_p,)
+			self.handle = self.dll.bst_init_w(self._dll_path)
+			if not self.handle:
+				raise OSError(f"bst_init failed for {self._dll_path}")
+			# Warmup utterance so the wrapper learns the engine's true output sample rate
+			# (the v2 language dlls don't all share one; e.g. Russian is 10800 hz).
+			size = c_long(0)
+			buf = self.dll.bst_speak(self.handle, byref(size), b"a", -1, 0, c_float(1.0), 0, False)
+			if buf: self.dll.bst_speech_free(buf)
+			sampleRate = self.dll.bst_get_sample_rate(c_void_p(self.handle))
+			self._use_helper = False
+		except (OSError, AttributeError):
+			# b32_wrapper.dll could not be loaded in-process (e.g. 32-bit DLL in
+			# 64-bit NVDA 2026+, or DLL simply absent). Fall back to the
+			# out-of-process 32-bit helper.
+			self.dll = None
+			self.handle = None
+			self._use_helper = True
+			sampleRate = self._start_helper()
+		self._createPlayer(sampleRate)
+
+	def _createPlayer(self, sampleRate):
+		if self.player:
+			try:
+				self.player.close()
+			except Exception:
+				pass
+		try:
+			currentSoundcardOutput = config.conf['speech']['outputDevice']
+		except:
+			currentSoundcardOutput = config.conf["audio"]["outputDevice"]
+		self.player = nvwave.WavePlayer(1, sampleRate or 11025, 16, outputDevice=currentSoundcardOutput)
+
 	def _start_helper(self):
-		helper_path = os.path.join(os.path.dirname(__file__), 'b32_helper.exe')
+		# Returns the engine's output sample rate as reported by the helper's startup
+		# handshake, or None if the helper could not be started.
+		helper_path = os.path.join(self._basePath, 'b32_helper.exe')
 		self._helper = subprocess.Popen(
 			[helper_path, self._dll_path],
 			stdin=subprocess.PIPE,
@@ -145,6 +213,15 @@ class SynthDriver(SynthDriver):
 			stderr=subprocess.DEVNULL,
 			creationflags=subprocess.CREATE_NO_WINDOW
 		)
+		hdr = self._helper_read_exact(8)
+		if hdr is None:
+			log.error("bestspeech helper died during startup for %s" % self._dll_path)
+			return None
+		magic, sampleRate = struct.unpack('<II', hdr)
+		if magic != 0xFFFFFFFE:
+			log.error("bestspeech helper sent unexpected handshake %#x" % magic)
+			return None
+		return sampleRate
 
 	def loadSettings(self, onlyChanged = False):
 		# We can probably remove this in a bit, we override this to make sure people's excitation setting doesn't break across addon versions.
@@ -225,6 +302,28 @@ class SynthDriver(SynthDriver):
 	def _get_phrasePrediction(self):
 		return self._phrasePrediction
 
+	def _set_bstLanguage(self, vl):
+		if vl not in self._availableBstLanguages or vl == self._bstLanguage:
+			return
+		self.cancel()
+		self._bstLanguage = vl
+		# The actual restart runs on the background thread, where all other engine access
+		# happens, so we can never tear the engine down under an in-progress utterance.
+		_execWhenDone(self._switchEngineBg, mustBeAsync=True)
+
+	def _switchEngineBg(self):
+		self._stopEngine()
+		self._initEngine()
+
+	def _get_bstLanguage(self):
+		return self._bstLanguage
+
+	def _get_availableBstLanguages(self):
+		return self._availableBstLanguages
+
+	def _get_language(self):
+		return languages[self._bstLanguage][2]
+
 	def _set_voice(self, vl):
 		if not vl in voices: return
 		self._voice = vl
@@ -294,7 +393,7 @@ class SynthDriver(SynthDriver):
 		# As a dirty hack to make indent nav beeps mostly work, indicate that we've reached the first index immedietly.
 		if idx and len(idx) > 1:
 			synthIndexReached.notify(synth=self, index=idx.pop(0))
-		txt = text.translate(self.table).encode('windows-1252', 'replace')
+		txt = text.translate(self.table).encode(self._encoding, 'replace')
 		self.dll.bst_speak_async(self.handle, on_audio, None, txt, -1, 0, c_float(4 if self.rateBoost else 1), 0)
 		if not self.speaking: return
 		f = lambda idx=idx: self.done(idx)
@@ -304,12 +403,14 @@ class SynthDriver(SynthDriver):
 	def _speakBg_helper(self, text, idx):
 		# Restart helper if it died unexpectedly.
 		if self._helper is None or self._helper.poll() is not None:
-			self._start_helper()
+			sampleRate = self._start_helper()
+			if sampleRate:
+				self._createPlayer(sampleRate)
 		self.speaking = True
 		# As a dirty hack to make indent nav beeps mostly work, indicate that we've reached the first index immedietly.
 		if idx and len(idx) > 1:
 			synthIndexReached.notify(synth=self, index=idx.pop(0))
-		txt = text.translate(self.table).encode('windows-1252', 'replace')
+		txt = text.translate(self.table).encode(self._encoding, 'replace')
 		rate_mult = 4.0 if self._rateBoost else 1.0
 		# Send SPEAK command: [uint32 text_len][float32 rate_mult][text bytes]
 		try:
@@ -354,10 +455,7 @@ class SynthDriver(SynthDriver):
 			synthIndexReached.notify(synth=self, index=i)
 		synthDoneSpeaking.notify(synth=self)
 
-	def terminate(self):
-		self.cancel()
-		bgQueue.put((None, None, None))
-		self.bgThread.join()
+	def _stopEngine(self):
 		if self._use_helper:
 			if self._helper is not None:
 				# Send QUIT command then wait for clean exit.
@@ -366,11 +464,27 @@ class SynthDriver(SynthDriver):
 					self._helper.stdin.flush()
 				except OSError:
 					pass
-				self._helper.wait(timeout=2)
+				try:
+					self._helper.wait(timeout=2)
+				except subprocess.TimeoutExpired:
+					pass
 				if self._helper.poll() is None:
 					self._helper.kill()
-		else:
-			self.dll.bst_free(self.handle)
+				self._helper = None
+		elif self.dll is not None and self.handle:
+			self.dll.bst_free(c_void_p(self.handle))
+			self.handle = None
+
+	def terminate(self):
+		self.cancel()
+		bgQueue.put((None, None, None))
+		self.bgThread.join()
+		self._stopEngine()
+		if self.player:
+			try:
+				self.player.close()
+			except Exception:
+				pass
 
 	def cancel(self):
 		self.speaking = False
