@@ -1,3 +1,4 @@
+import json
 import os
 import struct
 import subprocess
@@ -52,7 +53,9 @@ voices = {
 languages = OrderedDict([
 	("classic", ("Classic English (1994)", "b32_tts.dll", "en", "windows-1252")),
 	("eng", ("English", "dll_eng.dll", "en", "utf-8")),
-	("ara", ("Arabic", "dll_ara.dll", "ar", "utf-8")),
+	# Arabic (dll_ara.dll) is intentionally absent: that dll's synthesis core is a stub
+	# which emits the same short buffer of digital silence (peak amplitude 0) no matter
+	# what text it's given, in either Latin or Arabic script.
 	("dut", ("Dutch", "dll_dut.dll", "nl", "utf-8")),
 	("fre", ("French", "dll_fre.dll", "fr", "utf-8")),
 	("ger", ("German", "dll_ger.dll", "de", "utf-8")),
@@ -65,6 +68,24 @@ languages = OrderedDict([
 	("rus", ("Russian", "dll_rus.dll", "ru", "utf-8")),
 	("spa", ("Spanish", "dll_spa.dll", "es", "utf-8")),
 ])
+
+# Settings remembered separately for each language, snapshotted whenever the user
+# switches language (and on NVDA exit) and restored when they switch back. Stored as
+# a hand-editable json file in the NVDA user configuration directory so the profiles
+# survive addon updates.
+profileParams = ("voice", "rate", "rateBoost", "pitch", "inflection", "volume", "unvoicedVolume", "headsize", "excitation")
+# Defaults applied the first time a language is selected, before the user has stored
+# anything for it. The classic engine clips badly above 85 percent volume, while the
+# v2 dlls are much quieter (Russian peaks below 20 percent of full scale) and want 100.
+languageDefaults = {"classic": {"volume": 85}}
+v2LanguageDefaults = {"volume": 100}
+
+def _profilePath():
+	try:
+		import globalVars
+		return os.path.join(globalVars.appArgs.configPath, "bestspeechLanguageProfiles.json")
+	except Exception:
+		return os.path.join(os.path.dirname(__file__), "bestspeechLanguageProfiles.json")
 
 bst_async_callback = CFUNCTYPE(c_long, c_void_p, c_long, c_void_p)
 
@@ -144,6 +165,17 @@ class SynthDriver(SynthDriver):
 			# Nothing found; keep the classic entry so init proceeds (and fails loudly) the same way older addon versions did.
 			self._availableBstLanguages["classic"] = StringParameterInfo("classic", languages["classic"][0])
 		self._bstLanguage = "classic" if "classic" in self._availableBstLanguages else next(iter(self._availableBstLanguages))
+		# Suppressed until loadSettings completes, so the profile of the previously used
+		# language can't be clobbered with construction defaults during startup restore.
+		self._suppressProfileSnapshot = True
+		self._languageProfiles = {}
+		try:
+			with open(_profilePath(), "r", encoding="utf-8") as f:
+				self._languageProfiles = json.load(f)
+		except FileNotFoundError:
+			pass
+		except Exception:
+			log.error("Failed to load bestspeech language profiles", exc_info=True)
 		self._initEngine()
 		global bgQueue
 		bgQueue = queue.Queue()
@@ -234,6 +266,41 @@ class SynthDriver(SynthDriver):
 		# We can probably remove this in a bit, we override this to make sure people's excitation setting doesn't break across addon versions.
 		super().loadSettings(onlyChanged)
 		if self.excitation == "0": self.excitation = "3"
+		self._suppressProfileSnapshot = False
+
+	def _snapshotProfile(self):
+		# Remember the current parameters under the current language.
+		profile = {}
+		for p in profileParams:
+			try:
+				profile[p] = getattr(self, p)
+			except Exception:
+				pass
+		self._languageProfiles[self._bstLanguage] = profile
+		try:
+			with open(_profilePath(), "w", encoding="utf-8") as f:
+				json.dump(self._languageProfiles, f, indent="\t")
+		except Exception:
+			log.error("Failed to save bestspeech language profiles", exc_info=True)
+
+	def _applyProfile(self, langId):
+		profile = self._languageProfiles.get(langId)
+		if profile is None:
+			# First time this language is used; apply just its defaults and keep everything else as is.
+			profile = languageDefaults.get(langId, v2LanguageDefaults)
+		# Voice first, since setting it resets pitch, inflection and friends.
+		if "voice" in profile:
+			try:
+				self.voice = profile["voice"]
+			except Exception:
+				pass
+		for p in profileParams:
+			if p == "voice" or p not in profile:
+				continue
+			try:
+				setattr(self, p, profile[p])
+			except Exception:
+				pass
 
 	def _set_rate(self, vl):
 		self._rate = self._percentToParam(vl,minRate,maxRate)
@@ -313,7 +380,10 @@ class SynthDriver(SynthDriver):
 		if vl not in self._availableBstLanguages or vl == self._bstLanguage:
 			return
 		self.cancel()
+		if not self._suppressProfileSnapshot:
+			self._snapshotProfile()
 		self._bstLanguage = vl
+		self._applyProfile(vl)
 		# The actual restart runs on the background thread, where all other engine access
 		# happens, so we can never tear the engine down under an in-progress utterance.
 		_execWhenDone(self._switchEngineBg, mustBeAsync=True)
@@ -486,6 +556,9 @@ class SynthDriver(SynthDriver):
 			self.handle = None
 
 	def terminate(self):
+		# Remember this language's parameters for next session before shutting down.
+		if not self._suppressProfileSnapshot:
+			self._snapshotProfile()
 		self.cancel()
 		bgQueue.put((None, None, None))
 		self.bgThread.join()
