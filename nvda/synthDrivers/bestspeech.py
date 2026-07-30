@@ -492,7 +492,12 @@ class SynthDriver(SynthDriver):
 				lst.append(f"~f{f}]")
 		text = " ".join(lst)
 		if self._numberProcessing: text = self._formatNumbers(text)
-		text = f"~r{self._rate}]~e{self._excitation}]~v{self.headsize}]~f{self._pitch}]~g{self._volume}]~u{self._unvoicedVolume}]~h{self._inflection}]{text} ~|"
+		if self._bstLanguage == "classic":
+			text = f"~r{self._rate}]~e{self._excitation}]~v{self.headsize}]~f{self._pitch}]~g{self._volume}]~u{self._unvoicedVolume}]~h{self._inflection}]{text} ~|"
+		else:
+			# The v2 dlls ignore ~v (headsize) and ~h (inflection); don't send them at all,
+			# so values lingering in nvda.ini from classic sessions can never leak in here.
+			text = f"~r{self._rate}]~e{self._excitation}]~f{self._pitch}]~g{self._volume}]~u{self._unvoicedVolume}]{text} ~|"
 		_execWhenDone(self._speakBg, text, idx, mustBeAsync=True)
 
 	def _speakBg(self, text, idx):
