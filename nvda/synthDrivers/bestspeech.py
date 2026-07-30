@@ -99,7 +99,9 @@ class SynthDriver(SynthDriver):
 	name = 'bestspeech'
 	description = 'Bestspeech'
 	supportedSettings = (
-		DriverSetting("bstLanguage", "&Language", availableInSettingsRing=True),
+		# Note: the id must be a single lowercase word; NVDA's settings dialog derives the
+		# available-values attribute via id.capitalize(), which would mangle camelCase.
+		DriverSetting("bstlanguage", "&Language", availableInSettingsRing=True),
 		SynthDriver.VoiceSetting(),
 		SynthDriver.RateSetting(),
 		SynthDriver.RateBoostSetting(),
@@ -125,6 +127,11 @@ class SynthDriver(SynthDriver):
 		self._basePath = os.path.dirname(__file__)
 		self.player = None
 		self._helper = None
+		# The helper's stdin is written from both NVDA's main thread (cancel) and the
+		# background speech thread (speak). Without a lock those writes can interleave
+		# mid-command, corrupting the protocol framing, which surfaces as truncated
+		# utterances and speech that queues instead of cancelling.
+		self._helperLock = threading.Lock()
 		self.dll = None
 		self.handle = None
 		self._use_helper = False
@@ -302,7 +309,7 @@ class SynthDriver(SynthDriver):
 	def _get_phrasePrediction(self):
 		return self._phrasePrediction
 
-	def _set_bstLanguage(self, vl):
+	def _set_bstlanguage(self, vl):
 		if vl not in self._availableBstLanguages or vl == self._bstLanguage:
 			return
 		self.cancel()
@@ -315,10 +322,10 @@ class SynthDriver(SynthDriver):
 		self._stopEngine()
 		self._initEngine()
 
-	def _get_bstLanguage(self):
+	def _get_bstlanguage(self):
 		return self._bstLanguage
 
-	def _get_availableBstLanguages(self):
+	def _get_availableBstlanguages(self):
 		return self._availableBstLanguages
 
 	def _get_language(self):
@@ -412,11 +419,13 @@ class SynthDriver(SynthDriver):
 			synthIndexReached.notify(synth=self, index=idx.pop(0))
 		txt = text.translate(self.table).encode(self._encoding, 'replace')
 		rate_mult = 4.0 if self._rateBoost else 1.0
-		# Send SPEAK command: [uint32 text_len][float32 rate_mult][text bytes]
+		# Send SPEAK command: [uint32 text_len][float32 rate_mult][text bytes].
+		# Sent as a single write under the lock so a concurrent cancel from the main
+		# thread can never splice its bytes into the middle of this command.
 		try:
-			self._helper.stdin.write(struct.pack('<If', len(txt), rate_mult))
-			self._helper.stdin.write(txt)
-			self._helper.stdin.flush()
+			with self._helperLock:
+				self._helper.stdin.write(struct.pack('<If', len(txt), rate_mult) + txt)
+				self._helper.stdin.flush()
 		except OSError:
 			return
 		# Read audio chunks until end-of-utterance sentinel (chunk_len == 0).
@@ -460,8 +469,9 @@ class SynthDriver(SynthDriver):
 			if self._helper is not None:
 				# Send QUIT command then wait for clean exit.
 				try:
-					self._helper.stdin.write(struct.pack('<I', 0xFFFFFFFF))
-					self._helper.stdin.flush()
+					with self._helperLock:
+						self._helper.stdin.write(struct.pack('<I', 0xFFFFFFFF))
+						self._helper.stdin.flush()
 				except OSError:
 					pass
 				try:
@@ -498,8 +508,9 @@ class SynthDriver(SynthDriver):
 		if self._use_helper and self._helper is not None:
 			# Send CANCEL command: text_len == 0
 			try:
-				self._helper.stdin.write(struct.pack('<I', 0))
-				self._helper.stdin.flush()
+				with self._helperLock:
+					self._helper.stdin.write(struct.pack('<I', 0))
+					self._helper.stdin.flush()
 			except OSError:
 				pass
 
