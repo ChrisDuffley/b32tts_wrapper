@@ -499,10 +499,16 @@ class SynthDriver(SynthDriver):
 	def _getAvailableVoices(self):
 		return {v: VoiceInfo(v, v) for v in voices}
 
+	# Thousands separator used by number processing, per language. The classic/English
+	# frontends read comma groups naturally; European frontends treat the comma as a
+	# decimal mark, so they get the dot (or space) their locale groups with instead.
+	_numberSeparators = {"ger": ".", "dut": ".", "ita": ".", "spa": ".", "por": ".", "gre": ".", "fre": " ", "pol": " ", "rus": " "}
+
 	def _formatNumbers(self, text):
+		sep = self._numberSeparators.get(self._bstLanguage, ",")
 		def replace_num(m):
-			num_str = m.group(0)
-			return format(int(num_str), ",")
+			grouped = format(int(m.group(0)), ",")
+			return grouped if sep == "," else grouped.replace(",", sep)
 		return re.sub(r"\b\d{5,}\b", replace_num, text)
 
 	def _pitchValue(self, multiplier=1.0):

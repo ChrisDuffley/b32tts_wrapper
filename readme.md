@@ -16,7 +16,7 @@ In addition to the classic 1994 b32_tts.dll, the wrapper can load the stripped d
 A few things to be aware of with the v2 dlls:
 
 * Text passed to the speak functions is interpreted as utf-8 for v2 dlls, unlike the classic engine which takes windows-1252 bytes verbatim.
-* The v2 dlls declare a 10000hz output format (10800 for Russian), but the synthesis core is the same 11025hz-native engine family as the classic dll; honoring the declared rate renders every voice about 10 percent deep and chesty compared to how these dlls actually sounded in the wild (verified against a period recording). The wrapper therefore treats 11025hz as the true rate for all v2 output; bst_get_sample_rate, generated wav headers and the NVDA addon all follow.
+* Most v2 dlls declare a 10000hz output format, which renders their voices audibly deep and chesty; playing them at the classic engine's 11025hz overshoots into chipmunk instead. The family's true rate is 10800hz: formant envelope alignment against the classic engine peaks there, and the Russian dll is the one build that actually declares it. The wrapper therefore plays all v2 output at 10800hz; bst_get_sample_rate, generated wav headers and the NVDA addon all follow.
 * There is no parameter interface in these builds, but most of the language frontends still understand the inline tilde commands (~r rate, ~f pitch, ~g gain, ~u unvoiced gain and ~e excitation including whisper all work), which is how the wrapper and the NVDA addon apply settings to them. The ~v headsize and ~h inflection commands are ignored by all v2 dlls (verified empirically: any value produces byte identical audio), so the NVDA addon hides those two sliders while a v2 language is active.
 * Three language builds are special, established by byte comparing and whisper-transcribing their output: Polish reads tilde commands aloud as text, Japanese vocalizes a short artifact per command while applying no effect, and Greek strips commands together with all other non-Greek text (it only speaks Greek script). For these three the NVDA addon sends plain text only, realizes the rate setting through the bundled sonic time stretcher and volume through the audio player, and hides the settings that can't work. Arabic's dll is a stub that only ever emits silence, so it isn't offered at all.
 * The v2 dlls have a quirk where after synthesizing an utterance they blindly sleep for the audio's entire real time duration. The wrapper hooks Sleep and skips that nap on the synthesis thread, so speaking through them is just as instant as the classic engine.
@@ -85,7 +85,7 @@ Call this to free any data returned by bst_speak. Do not use this within the con
 
 ```int bst_get_sample_rate(bst_state* s);```
 
-Returns the engine's output sample rate in hz: 11025 for both the classic engine and (by deliberate override of their misdeclared 10000/10800 formats, see the language support section) the v2 language dlls.
+Returns the engine's output sample rate in hz: 11025 for the classic engine, 10800 for the v2 language dlls (by deliberate override of the misdeclared 10000hz formats most of them report; see the language support section).
 
 
 ```bool bst_is_v2(bst_state* s);```

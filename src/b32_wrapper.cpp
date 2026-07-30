@@ -88,12 +88,13 @@ b32w_export BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 MMRESULT WINAPI waveOutOpenHook(LPHWAVEOUT outptr, UINT device, LPCWAVEFORMATEX format, DWORD_PTR callback, DWORD_PTR instance, DWORD flags) {
 	if (!winmm_hooked_state || ((bst_state*)callback != winmm_hooked_state && !winmm_hooked_state->is_v2)) return waveOutOpenProc(outptr, device, format, callback, instance, flags);
 	*outptr = (HWAVEOUT)winmm_hooked_state; // Now all other hooks will receive state information in their first parameter, though we prefer to use winmm_hooked_state. This also makes sure our hook returns a semblance of what the calling function is expecting.
-	// The v2 dlls declare 10000hz (10800 for Russian) but the synthesis core is the
-	// same 11025hz-native engine family as the classic dll; honoring the declared rate
-	// renders every voice about 10 percent deep and chesty. Anthony's demo recording of
-	// these dlls matches 11025hz playback, so that is treated as the true rate for all
-	// v2 output (wav headers, the helper handshake and sonic all follow).
-	winmm_hooked_state->sample_rate = winmm_hooked_state->is_v2? 11025 : format->nSamplesPerSec;
+	// Most v2 dlls declare a 10000hz format, which renders their 11025-family synthesis
+	// core audibly deep and chesty; 11025 itself overshoots into chipmunk. Two clues
+	// pin the true rate at 10800: formant envelope alignment against the classic engine
+	// peaks at 10700-10800hz, and the Russian dll actually declares 10800 - the one
+	// build that told the truth. All v2 output is therefore played at 10800 (wav
+	// headers, the helper handshake and sonic all follow).
+	winmm_hooked_state->sample_rate = winmm_hooked_state->is_v2? 10800 : format->nSamplesPerSec;
 	winmm_hooked_state->bass_lp = 0.0f;
 	winmm_hooked_state->bass_a = 0.0f; // Set below if the tone shelf is wanted.
 	// Now that the true output format is known, bring the sonic stream in line with it. The v2 language dlls don't all share one sample rate, so this can't be hardcoded.
