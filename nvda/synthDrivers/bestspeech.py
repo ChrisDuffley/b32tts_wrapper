@@ -48,25 +48,35 @@ voices = {
 # Available engine languages. "classic" is the original 1994 b32_tts.dll this addon has
 # always used; the rest are the 2006 "v2" language dlls (from the Lingvosoft era, preserved
 # by Rommix) which take utf-8 text and vary in output sample rate. Each entry is:
-# language id -> (display label, dll filename, NVDA language code, text encoding).
+# language id -> (display label, dll filename, NVDA language code, text encoding, command mode).
 # Only languages whose dll actually exists in this directory are offered in the dialog.
+#
+# The command mode records what each build's text frontend does with inline tilde
+# commands, established empirically (byte comparison plus whisper transcription of the
+# outputs):
+# * "classic": the 1994 engine, all commands work including ~v headsize and ~h inflection.
+# * "tilde": commands work except ~v/~h which are silently ignored (most v2 dlls).
+# * "none": commands must not be sent at all. Polish reads them aloud as text; Japanese
+#   vocalizes a short artifact per command while applying no effect; Greek strips them
+#   along with all other non-Greek text. For these, rate is applied through the sonic
+#   time stretcher and volume through the audio player instead.
 languages = OrderedDict([
-	("classic", ("Classic English (1994)", "b32_tts.dll", "en", "windows-1252")),
-	("eng", ("English", "dll_eng.dll", "en", "utf-8")),
+	("classic", ("Classic English (1994)", "b32_tts.dll", "en", "windows-1252", "classic")),
+	("eng", ("English", "dll_eng.dll", "en", "utf-8", "tilde")),
 	# Arabic (dll_ara.dll) is intentionally absent: that dll's synthesis core is a stub
 	# which emits the same short buffer of digital silence (peak amplitude 0) no matter
 	# what text it's given, in either Latin or Arabic script.
-	("dut", ("Dutch", "dll_dut.dll", "nl", "utf-8")),
-	("fre", ("French", "dll_fre.dll", "fr", "utf-8")),
-	("ger", ("German", "dll_ger.dll", "de", "utf-8")),
-	("gre", ("Greek", "dll_gre.dll", "el", "utf-8")),
-	("heb", ("Hebrew", "dll_heb.dll", "he", "utf-8")),
-	("ita", ("Italian", "dll_ita.dll", "it", "utf-8")),
-	("jpn", ("Japanese", "dll_jpn.dll", "ja", "utf-8")),
-	("pol", ("Polish", "dll_pol.dll", "pl", "utf-8")),
-	("por", ("Portuguese", "dll_por.dll", "pt", "utf-8")),
-	("rus", ("Russian", "dll_rus.dll", "ru", "utf-8")),
-	("spa", ("Spanish", "dll_spa.dll", "es", "utf-8")),
+	("dut", ("Dutch", "dll_dut.dll", "nl", "utf-8", "tilde")),
+	("fre", ("French", "dll_fre.dll", "fr", "utf-8", "tilde")),
+	("ger", ("German", "dll_ger.dll", "de", "utf-8", "tilde")),
+	("gre", ("Greek", "dll_gre.dll", "el", "utf-8", "none")),
+	("heb", ("Hebrew", "dll_heb.dll", "he", "utf-8", "tilde")),
+	("ita", ("Italian", "dll_ita.dll", "it", "utf-8", "tilde")),
+	("jpn", ("Japanese", "dll_jpn.dll", "ja", "utf-8", "none")),
+	("pol", ("Polish", "dll_pol.dll", "pl", "utf-8", "none")),
+	("por", ("Portuguese", "dll_por.dll", "pt", "utf-8", "tilde")),
+	("rus", ("Russian", "dll_rus.dll", "ru", "utf-8", "tilde")),
+	("spa", ("Spanish", "dll_spa.dll", "es", "utf-8", "tilde")),
 ])
 
 # Settings remembered separately for each language, snapshotted whenever the user
@@ -166,16 +176,24 @@ class SynthDriver(SynthDriver):
 		BooleanDriverSetting("abbreviations", "&Abbreviations", defaultVal=True),
 		BooleanDriverSetting("phrasePrediction", "&Phrase Prediction", defaultVal=True)
 	)
-	# Tilde commands the 2006 v2 dlls simply ignore (verified empirically: ~v and ~h
-	# produce byte-identical audio for any value), so their settings are hidden while
-	# a v2 language is active. Rate, pitch, volume, unvoiced volume and excitation
-	# (including whisper) all still work in those builds.
-	_v2DeadSettings = ("headsize", "inflection")
+	# Settings that do nothing for a given command mode are hidden from the dialog and
+	# the settings ring. For "none" languages, rate still works (via sonic), volume
+	# still works (via the player), and rate boost and number processing are engine
+	# independent; everything command-driven is dead.
+	_deadSettingsByMode = {
+		"classic": (),
+		"tilde": ("headsize", "inflection"),
+		"none": ("voice", "pitch", "inflection", "headsize", "excitation", "unvoicedVolume", "abbreviations", "phrasePrediction"),
+	}
+
+	def _currentCmdMode(self):
+		return languages[getattr(self, "_bstLanguage", "classic")][4]
 
 	def _get_supportedSettings(self):
-		if getattr(self, "_bstLanguage", "classic") == "classic":
+		dead = self._deadSettingsByMode[self._currentCmdMode()]
+		if not dead:
 			return self._allSupportedSettings
-		return tuple(s for s in self._allSupportedSettings if s.id not in self._v2DeadSettings)
+		return tuple(s for s in self._allSupportedSettings if s.id not in dead)
 	supportedNotifications = {synthIndexReached, synthDoneSpeaking}
 	supportedCommands = {PitchCommand, CharacterModeCommand, IndexCommand}
 
@@ -199,7 +217,7 @@ class SynthDriver(SynthDriver):
 		self._use_helper = False
 		# Only offer languages whose engine dll is actually present next to this driver.
 		self._availableBstLanguages = OrderedDict()
-		for langId, (label, dllName, nvdaLang, encoding) in languages.items():
+		for langId, (label, dllName, nvdaLang, encoding, cmdMode) in languages.items():
 			if os.path.isfile(os.path.join(self._basePath, dllName)):
 				self._availableBstLanguages[langId] = StringParameterInfo(langId, label)
 		if not self._availableBstLanguages:
@@ -234,7 +252,7 @@ class SynthDriver(SynthDriver):
 	def _initEngine(self):
 		# (Re)starts the engine for the currently selected language, either in-process or
 		# via the 32-bit helper, then creates a player matching the engine's sample rate.
-		label, dllName, nvdaLang, encoding = languages[self._bstLanguage]
+		label, dllName, nvdaLang, encoding, cmdMode = languages[self._bstLanguage]
 		self._dll_path = os.path.join(self._basePath, dllName)
 		self._encoding = encoding
 		wrapper_path = os.path.join(self._basePath, 'b32_wrapper.dll')
@@ -281,6 +299,20 @@ class SynthDriver(SynthDriver):
 		except:
 			currentSoundcardOutput = config.conf["audio"]["outputDevice"]
 		self.player = nvwave.WavePlayer(1, sampleRate or 11025, 16, outputDevice=currentSoundcardOutput)
+		self._applyPlayerVolume()
+
+	def _applyPlayerVolume(self):
+		# For "none" command mode languages the ~g gain command can't be used, so volume
+		# is applied at the player instead. Other modes keep the player at unity.
+		if not self.player:
+			return
+		try:
+			if self._currentCmdMode() == "none":
+				self.player.setVolume(all=max(0.0, min(1.0, getattr(self, "volume", 100) / 100.0)))
+			else:
+				self.player.setVolume(all=1.0)
+		except Exception:
+			pass
 
 	def _start_helper(self):
 		# Returns the engine's output sample rate as reported by the helper's startup
@@ -363,6 +395,7 @@ class SynthDriver(SynthDriver):
 
 	def _set_volume(self, vl):
 		self._volume = self._percentToParam(vl,minVolume,maxVolume)
+		self._applyPlayerVolume()
 
 	def _get_volume(self):
 		return self._paramToPercent(self._volume, minVolume, maxVolume)
@@ -468,37 +501,52 @@ class SynthDriver(SynthDriver):
 		return re.sub(r"\b\d{5,}\b", replace_num, text)
 
 	def speak(self, speechSequence):
-		lst = ["~n10,0]" if self._abbreviations else "~n10,1]", "~~1,0]" if self._phrasePrediction else "~~1,1]"]
+		cmdMode = self._currentCmdMode()
+		useCommands = cmdMode != "none"
+		lst = ["~n10,0]" if self._abbreviations else "~n10,1]", "~~1,0]" if self._phrasePrediction else "~~1,1]"] if useCommands else []
 		idx = []
 		char_mode_on = pitch_modified = False
 		for item in speechSequence:
 			if isinstance(item, str):
 				lst.append(item)
 				if char_mode_on:
-					lst.append("~n1,0]")
+					if useCommands: lst.append("~n1,0]")
 					char_mode_on = False
 				if pitch_modified:
-					lst.append(f"~f{self._pitch}]")
+					if useCommands: lst.append(f"~f{self._pitch}]")
 					pitch_modified = False
 			elif isinstance(item, IndexCommand):
 				idx.append(item.index)
 			elif isinstance(item,CharacterModeCommand):
 				char_mode_on = bool(item.state)
-				lst.append("~n1,1]" if char_mode_on else "~n1,0]")
+				if useCommands: lst.append("~n1,1]" if char_mode_on else "~n1,0]")
 			elif isinstance(item,PitchCommand):
 				try: multiplier = item.multiplier
 				except ZeroDevisionError: multiplier = 1
 				f = int(self._pitch * multiplier)
-				lst.append(f"~f{f}]")
+				if useCommands: lst.append(f"~f{f}]")
 		text = " ".join(lst)
 		if self._numberProcessing: text = self._formatNumbers(text)
-		if self._bstLanguage == "classic":
+		if cmdMode == "classic":
 			text = f"~r{self._rate}]~e{self._excitation}]~v{self.headsize}]~f{self._pitch}]~g{self._volume}]~u{self._unvoicedVolume}]~h{self._inflection}]{text} ~|"
-		else:
-			# The v2 dlls ignore ~v (headsize) and ~h (inflection); don't send them at all,
+		elif cmdMode == "tilde":
+			# These dlls ignore ~v (headsize) and ~h (inflection); don't send them at all,
 			# so values lingering in nvda.ini from classic sessions can never leak in here.
 			text = f"~r{self._rate}]~e{self._excitation}]~f{self._pitch}]~g{self._volume}]~u{self._unvoicedVolume}]{text} ~|"
+		# "none" mode: plain text only. Rate is applied via sonic in the speak path and
+		# volume via the player; anything else would be read aloud or vocalized as junk.
 		_execWhenDone(self._speakBg, text, idx, mustBeAsync=True)
+
+	def _rateMultiplier(self):
+		# Rate boost quadruples speed via sonic on every engine. For "none" command mode
+		# languages the engine's own ~r rate command can't be used either, so the whole
+		# rate setting is realized through sonic: the classic rate parameter is a
+		# percentage of normal duration (-90 fastest .. 200 slowest), which maps to a
+		# time stretch factor of 100/(100+rate), clamped to sonic-sane bounds.
+		mult = 4.0 if self._rateBoost else 1.0
+		if self._currentCmdMode() == "none":
+			mult *= max(0.33, min(8.0, 100.0 / (100.0 + self._rate)))
+		return mult
 
 	def _speakBg(self, text, idx):
 		if self._use_helper:
@@ -517,7 +565,7 @@ class SynthDriver(SynthDriver):
 		if idx and len(idx) > 1:
 			synthIndexReached.notify(synth=self, index=idx.pop(0))
 		txt = text.translate(self.table).encode(self._encoding, 'replace')
-		self.dll.bst_speak_async(self.handle, on_audio, None, txt, -1, 0, c_float(4 if self.rateBoost else 1), 0)
+		self.dll.bst_speak_async(self.handle, on_audio, None, txt, -1, 0, c_float(self._rateMultiplier()), 0)
 		if not self.speaking: return
 		f = lambda idx=idx: self.done(idx)
 		self.player.feed(b"", 0, onDone=f)
@@ -534,7 +582,7 @@ class SynthDriver(SynthDriver):
 		if idx and len(idx) > 1:
 			synthIndexReached.notify(synth=self, index=idx.pop(0))
 		txt = text.translate(self.table).encode(self._encoding, 'replace')
-		rate_mult = 4.0 if self._rateBoost else 1.0
+		rate_mult = self._rateMultiplier()
 		log.debug(f"BSTDBG speakBg start len={len(txt)} mult={rate_mult}")
 		# Send SPEAK command: [uint32 text_len][float32 rate_mult][text bytes].
 		# Sent as a single write under the lock so a concurrent cancel from the main
