@@ -89,6 +89,36 @@ def _profilePath():
 
 bst_async_callback = CFUNCTYPE(c_long, c_void_p, c_long, c_void_p)
 
+def _patchVoicePanelLanguageRefresh():
+	# NVDA's voice settings panel only refreshes its other controls when the *voice*
+	# setting changes, so after a language switch the sliders would keep showing the
+	# previous language's values (and our per-language supported settings wouldn't be
+	# rebuilt). Patch StringDriverSettingChanger, for this driver's language setting
+	# only, to trigger the same refresh a voice change does. Technique borrowed from
+	# Tomi's TGSpeechBox addon, compatible with NVDA 2024.1 through 2026.1.
+	try:
+		import gui.settingsDialogs as sd
+		changerCls = getattr(sd, "StringDriverSettingChanger", None)
+		if changerCls is None or getattr(changerCls, "_bestspeechLanguageRefreshPatched", False):
+			return
+		origCall = changerCls.__call__
+		def patchedCall(self, evt):
+			origCall(self, evt)
+			try:
+				if getattr(getattr(self, "setting", None), "id", None) != "bstlanguage":
+					return
+				if getattr(getattr(self, "driver", None), "name", None) != "bestspeech":
+					return
+				updateFn = getattr(getattr(self, "container", None), "updateDriverSettings", None)
+				if callable(updateFn):
+					updateFn(changedSetting="bstlanguage")
+			except Exception:
+				log.debug("bestspeech: could not refresh voice panel after language change", exc_info=True)
+		changerCls.__call__ = patchedCall
+		changerCls._bestspeechLanguageRefreshPatched = True
+	except Exception:
+		log.debug("bestspeech: failed to patch voice panel language refresh", exc_info=True)
+
 # The BGThread from espeak
 class BgThread(threading.Thread):
 	def __init__(self):
@@ -119,7 +149,7 @@ def _execWhenDone(func, *args, mustBeAsync=False, **kwargs):
 class SynthDriver(SynthDriver):
 	name = 'bestspeech'
 	description = 'Bestspeech'
-	supportedSettings = (
+	_allSupportedSettings = (
 		# Note: the id must be a single lowercase word; NVDA's settings dialog derives the
 		# available-values attribute via id.capitalize(), which would mangle camelCase.
 		DriverSetting("bstlanguage", "&Language", availableInSettingsRing=True),
@@ -136,6 +166,16 @@ class SynthDriver(SynthDriver):
 		BooleanDriverSetting("abbreviations", "&Abbreviations", defaultVal=True),
 		BooleanDriverSetting("phrasePrediction", "&Phrase Prediction", defaultVal=True)
 	)
+	# Tilde commands the 2006 v2 dlls simply ignore (verified empirically: ~v and ~h
+	# produce byte-identical audio for any value), so their settings are hidden while
+	# a v2 language is active. Rate, pitch, volume, unvoiced volume and excitation
+	# (including whisper) all still work in those builds.
+	_v2DeadSettings = ("headsize", "inflection")
+
+	def _get_supportedSettings(self):
+		if getattr(self, "_bstLanguage", "classic") == "classic":
+			return self._allSupportedSettings
+		return tuple(s for s in self._allSupportedSettings if s.id not in self._v2DeadSettings)
 	supportedNotifications = {synthIndexReached, synthDoneSpeaking}
 	supportedCommands = {PitchCommand, CharacterModeCommand, IndexCommand}
 
@@ -145,6 +185,7 @@ class SynthDriver(SynthDriver):
 
 	def __init__(self):
 		super().__init__()
+		_patchVoicePanelLanguageRefresh()
 		self._basePath = os.path.dirname(__file__)
 		self.player = None
 		self._helper = None
