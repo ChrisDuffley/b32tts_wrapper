@@ -42,6 +42,8 @@ struct bst_state {
 	float pending_rate_multiplier;
 	float bass_lp; // One pole lowpass state for the v2 tone correction shelf.
 	float bass_a;  // Its coefficient, derived from the utterance's sample rate; 0 disables the shelf (classic).
+	bool v2_trim_lead;  // Strip near-silent leading edge of the current chunk's audio (chunk is not the utterance's first).
+	bool v2_trim_trail; // Strip near-silent trailing edge (more chunks follow), tightening the join.
 	bst_async_callback async_callback;
 	void* async_callback_user;
 	bool async_stop_speaking;

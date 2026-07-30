@@ -156,6 +156,25 @@ MMRESULT WINAPI waveOutWriteHook(HWAVEOUT ptr, WAVEHDR* header, UINT size) {
 	if (winmm_hooked_state->async_stop_speaking) return MMSYSERR_NOERROR; // Callback returned false, drop all remaining buffers.
 	short* data = (short*)header->lpData;
 	DWORD data_len = header->dwBufferLength;
+	if (winmm_hooked_state->is_v2 && (winmm_hooked_state->v2_trim_lead || winmm_hooked_state->v2_trim_trail)) {
+		// Chunked v2 utterance: strip near-silent edges facing another chunk so the
+		// engine's per-utterance dead air doesn't become a long pause at every join.
+		DWORD n = data_len / sizeof(short);
+		const short th = 160;
+		const DWORD max_trim = 3200; // ~300ms
+		if (winmm_hooked_state->v2_trim_lead) {
+			DWORD k = 0;
+			while (k < n && k < max_trim && data[k] > -th && data[k] < th) k++;
+			data += k;
+			n -= k;
+		}
+		if (winmm_hooked_state->v2_trim_trail && n) {
+			DWORD k = 0;
+			while (k < n && k < max_trim && data[n - 1 - k] > -th && data[n - 1 - k] < th) k++;
+			n -= k;
+		}
+		data_len = n * sizeof(short);
+	}
 	// The read cap must be in samples, not bytes: passing data_len (bytes) as maxSamples
 	// let sonic write up to twice the engine's buffer when slowing down (output larger
 	// than input), corrupting the heap. Rate boost never hit this (speedup shrinks

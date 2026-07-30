@@ -578,6 +578,9 @@ class SynthDriver(SynthDriver):
 				except ZeroDevisionError: multiplier = 1
 				if useCommands: lst.append(f"~f{self._pitchValue(multiplier)}]")
 		text = " ".join(lst)
+		# Collapse whitespace runs: layout padding counts toward the v2 dlls' 128 byte
+		# phrase buffer, needlessly forcing mid-sentence chunk cuts (and their pauses).
+		text = re.sub(r"\s{2,}", " ", text)
 		text = self._normalizeDecimals(text)
 		if cmdMode == "none":
 			# These languages' frontends can't read digits (Japanese and Greek drop them

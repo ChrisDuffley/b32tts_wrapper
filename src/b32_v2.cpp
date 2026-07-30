@@ -55,7 +55,7 @@ bool bst_v2_setup(bst_state* s) {
 // contains a punctuation-free run longer than V2_PHRASE_LIMIT; the engine flushes its
 // phrase buffer at end of input, so a mid-sentence chunk end acts as a phrase break.
 #define V2_CHUNK_LIMIT 240
-#define V2_PHRASE_LIMIT 100
+#define V2_PHRASE_LIMIT 112 // measured ceiling is 122-127; margin without cutting more often than needed
 
 static bool bst_v2_is_break(wchar_t c) {
 	return c == L'.' || c == L'!' || c == L'?' || c == L'\n' || c == 0x3002 || c == 0xFF01 || c == 0xFF1F;
@@ -128,7 +128,8 @@ void bst_v2_speak(bst_state* s, const char* utf8_text) {
 		}
 		if (take < remain) {
 			// Prefer to break after sentence punctuation the engine honors (dot inside
-			// a URL or filename doesn't count), else at whitespace.
+			// a URL or filename doesn't count), then after an honored comma (a pause
+			// there sounds intended), else at whitespace.
 			int cut = -1;
 			for (int i = take - 1; i > take / 4; i--) {
 				if (bst_v2_is_break(content[pos + i]) && bst_v2_phrase_break_at(content + pos, remain, i)) { cut = i + 1; break; }
@@ -136,7 +137,13 @@ void bst_v2_speak(bst_state* s, const char* utf8_text) {
 			if (cut < 0) {
 				for (int i = take - 1; i > take / 4; i--) {
 					wchar_t c = content[pos + i];
-					if (c == L' ' || c == L'\t' || c == 0x3001 || c == 0xFF0C) { cut = i + 1; break; }
+					if ((c == L',' || c == 0x3001 || c == 0xFF0C) && bst_v2_phrase_break_at(content + pos, remain, i)) { cut = i + 1; break; }
+				}
+			}
+			if (cut < 0) {
+				for (int i = take - 1; i > take / 4; i--) {
+					wchar_t c = content[pos + i];
+					if (c == L' ' || c == L'\t') { cut = i + 1; break; }
 				}
 			}
 			if (cut > 0) take = cut;
@@ -153,6 +160,9 @@ void bst_v2_speak(bst_state* s, const char* utf8_text) {
 		memcpy(chunk, wtext, prefix_len * sizeof(wchar_t));
 		memcpy(chunk + prefix_len, content + pos, take * sizeof(wchar_t));
 		chunk[prefix_len + take] = 0;
+		// Tighten the joins: strip dead air from chunk edges that face another chunk.
+		s->v2_trim_lead = pos > 0;
+		s->v2_trim_trail = pos + take < content_len;
 		if (bst_v2_debug()) fwprintf(stderr, L"[v2chunk] pos=%d take=%d stop=%d text=%.48s\n", pos, take, (int)s->async_stop_speaking, chunk + prefix_len);
 		s->v2_say(chunk);
 		if (bst_v2_debug()) fwprintf(stderr, L"[v2chunk] said, stop=%d\n", (int)s->async_stop_speaking);
