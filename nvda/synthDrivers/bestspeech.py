@@ -582,6 +582,15 @@ class SynthDriver(SynthDriver):
 		# phrase buffer, needlessly forcing mid-sentence chunk cuts (and their pauses).
 		text = re.sub(r"\s{2,}", " ", text)
 		text = self._normalizeDecimals(text)
+		if cmdMode != "classic":
+			# Two v2 frontend quirks. Its normalizer expands apostrophe-s into "is",
+			# so possessives read as "Ivan is"; dropping just the apostrophe gives the
+			# identical-sounding plain form (Ivans, its, lets) while other contractions
+			# stay untouched. And dashes are vocalized as a stray "oo"; a comma is what
+			# an em dash means in prose anyway, and NVDA still announces the symbol
+			# name at higher punctuation levels before text ever reaches us.
+			text = re.sub(r"(?<=\w)['’]s\b", "s", text)
+			text = re.sub(r"\s*[–—―]+\s*", ", ", text)
 		if cmdMode == "none":
 			# These languages' frontends can't read digits (Japanese and Greek drop them
 			# entirely, Polish only spells them); convert numbers to words in Python.
