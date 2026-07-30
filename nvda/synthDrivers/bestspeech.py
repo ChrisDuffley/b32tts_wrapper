@@ -523,6 +523,22 @@ class SynthDriver(SynthDriver):
 	# decimal mark, so they get the dot (or space) their locale groups with instead.
 	_numberSeparators = {"ger": ".", "dut": ".", "ita": ".", "spa": ".", "por": ".", "gre": ".", "fre": " ", "pol": " ", "rus": " "}
 
+	# Spoken word for the decimal point, per language. The engines treat a dot between
+	# digits as sentence punctuation ("7.1" becomes "seven. <pause> one"), so decimals
+	# are rewritten as words before any other processing. Also covers version strings
+	# and IP addresses, which read as "2026 point 1 point 4" style.
+	_decimalWords = {
+		"classic": "point", "eng": "point", "spa": "punto", "fre": "virgule",
+		"ger": "Komma", "ita": "virgola", "por": "vírgula", "dut": "komma",
+		"pol": "przecinek", "rus": "запятая",
+		"gre": "κόμμα", "heb": "נקודה",
+		"jpn": "てん",
+	}
+
+	def _normalizeDecimals(self, text):
+		word = self._decimalWords.get(self._bstLanguage, "point")
+		return re.sub(r"(?<=\d)\.(?=\d)", f" {word} ", text)
+
 	def _formatNumbers(self, text):
 		sep = self._numberSeparators.get(self._bstLanguage, ",")
 		def replace_num(m):
@@ -562,6 +578,7 @@ class SynthDriver(SynthDriver):
 				except ZeroDevisionError: multiplier = 1
 				if useCommands: lst.append(f"~f{self._pitchValue(multiplier)}]")
 		text = " ".join(lst)
+		text = self._normalizeDecimals(text)
 		if cmdMode == "none":
 			# These languages' frontends can't read digits (Japanese and Greek drop them
 			# entirely, Polish only spells them); convert numbers to words in Python.
