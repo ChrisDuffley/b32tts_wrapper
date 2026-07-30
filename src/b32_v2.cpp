@@ -10,9 +10,10 @@
 // * Each utterance is synthesized into a single buffer, played via one waveOutWrite, after
 //   which the dll blindly sleeps out the audio's real time duration before returning. The
 //   wrapper's Sleep hook (see b32_wrapper.cpp) skips that nap so synthesis is instant.
-// * Output is 16 bit mono like the classic engine, but the sample rate varies per language
-//   dll (typically 10000hz, 10800hz for Russian), so consumers should query
-//   bst_get_sample_rate rather than assuming 11025.
+// * Output is 16 bit mono like the classic engine. The dlls declare 10000hz formats
+//   (10800 for Russian), but the synthesis core is the same 11025hz-native engine family
+//   as the classic dll and honoring the declaration renders everything ~10% deep; the
+//   wrapper overrides the rate to 11025 for all v2 output (see waveOutOpenHook).
 // This is released into the public domain.
 
 #include <windows.h>

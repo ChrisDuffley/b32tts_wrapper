@@ -38,7 +38,7 @@ struct bst_state {
 	v2InitFunc v2_init;
 	v2DeInitFunc v2_deinit;
 	v2SayFunc v2_say;
-	int sample_rate; // Updated from the format each waveOutOpen provides; classic is 11025, v2 dlls are typically 10000 (Russian is 10800).
+	int sample_rate; // The true output rate: what waveOutOpen declares for classic (11025), overridden to 11025 for v2 dlls whose declared 10000/10800 formats misstate their 11025-native synthesis core.
 	float pending_rate_multiplier;
 	float bass_lp; // One pole lowpass state for the v2 tone correction shelf.
 	float bass_a;  // Its coefficient, derived from the utterance's sample rate; 0 disables the shelf (classic).

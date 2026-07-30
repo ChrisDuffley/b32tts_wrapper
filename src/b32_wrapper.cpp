@@ -88,20 +88,21 @@ b32w_export BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 MMRESULT WINAPI waveOutOpenHook(LPHWAVEOUT outptr, UINT device, LPCWAVEFORMATEX format, DWORD_PTR callback, DWORD_PTR instance, DWORD flags) {
 	if (!winmm_hooked_state || ((bst_state*)callback != winmm_hooked_state && !winmm_hooked_state->is_v2)) return waveOutOpenProc(outptr, device, format, callback, instance, flags);
 	*outptr = (HWAVEOUT)winmm_hooked_state; // Now all other hooks will receive state information in their first parameter, though we prefer to use winmm_hooked_state. This also makes sure our hook returns a semblance of what the calling function is expecting.
-	winmm_hooked_state->sample_rate = format->nSamplesPerSec;
-	// Tone correction for the v2 dlls: their voice models carry about 8 percentage
-	// points more energy below 500hz than the classic engine at identical settings,
-	// heard as a chesty, boomy character. A gentle -4db low shelf (applied in
-	// waveOutput) brings their spectral balance in line with classic.
+	// The v2 dlls declare 10000hz (10800 for Russian) but the synthesis core is the
+	// same 11025hz-native engine family as the classic dll; honoring the declared rate
+	// renders every voice about 10 percent deep and chesty. Anthony's demo recording of
+	// these dlls matches 11025hz playback, so that is treated as the true rate for all
+	// v2 output (wav headers, the helper handshake and sonic all follow).
+	winmm_hooked_state->sample_rate = winmm_hooked_state->is_v2? 11025 : format->nSamplesPerSec;
 	winmm_hooked_state->bass_lp = 0.0f;
-	winmm_hooked_state->bass_a = winmm_hooked_state->is_v2? 1.0f - expf(-6.2832f * 500.0f / format->nSamplesPerSec) : 0.0f;
+	winmm_hooked_state->bass_a = 0.0f; // Set below if the tone shelf is wanted.
 	// Now that the true output format is known, bring the sonic stream in line with it. The v2 language dlls don't all share one sample rate, so this can't be hardcoded.
-	if (winmm_hooked_state->sonic_stream && sonicGetSampleRate(winmm_hooked_state->sonic_stream) != (int)format->nSamplesPerSec) sonicSetSampleRate(winmm_hooked_state->sonic_stream, format->nSamplesPerSec);
-	if (!winmm_hooked_state->sonic_stream && winmm_hooked_state->pending_rate_multiplier != 1.0f) winmm_hooked_state->sonic_stream = sonicCreateStream(format->nSamplesPerSec, 1);
+	if (winmm_hooked_state->sonic_stream && sonicGetSampleRate(winmm_hooked_state->sonic_stream) != winmm_hooked_state->sample_rate) sonicSetSampleRate(winmm_hooked_state->sonic_stream, winmm_hooked_state->sample_rate);
+	if (!winmm_hooked_state->sonic_stream && winmm_hooked_state->pending_rate_multiplier != 1.0f) winmm_hooked_state->sonic_stream = sonicCreateStream(winmm_hooked_state->sample_rate, 1);
 	if (winmm_hooked_state->sonic_stream) sonicSetSpeed(winmm_hooked_state->sonic_stream, winmm_hooked_state->pending_rate_multiplier);
 	if (!winmm_hooked_state->audio && !winmm_hooked_state->async_callback) {
 		winmm_hooked_state->audio = (char*)malloc(winmm_hooked_state->audio_capacity);
-		if (winmm_hooked_state->audio_size) make_wav_header_in_place((wav_header*)winmm_hooked_state->audio, 0, format->nSamplesPerSec, format->wBitsPerSample, format->nChannels, format->wFormatTag);
+		if (winmm_hooked_state->audio_size) make_wav_header_in_place((wav_header*)winmm_hooked_state->audio, 0, winmm_hooked_state->sample_rate, format->wBitsPerSample, format->nChannels, format->wFormatTag);
 	}
 	return MMSYSERR_NOERROR;
 }
