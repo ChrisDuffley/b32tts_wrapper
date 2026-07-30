@@ -464,6 +464,17 @@ class SynthDriver(SynthDriver):
 			self._snapshotProfile()
 		self._bstLanguage = vl
 		self._applyProfile(vl)
+		# The synth settings ring builds its list of settings once per synth load, so
+		# without a poke it keeps offering settings the new language just hid (e.g.
+		# headsize on a v2 language). The dialog reads supportedSettings fresh and is
+		# refreshed by our StringDriverSettingChanger patch; the ring needs this.
+		try:
+			import globalVars
+			ring = getattr(globalVars, "settingsRing", None)
+			if ring is not None:
+				ring.updateSupportedSettings(self)
+		except Exception:
+			log.debug("bestspeech: could not refresh synth settings ring", exc_info=True)
 		# The actual restart runs on the background thread, where all other engine access
 		# happens, so we can never tear the engine down under an in-progress utterance.
 		_execWhenDone(self._switchEngineBg, mustBeAsync=True)
@@ -719,6 +730,15 @@ class SynthDriver(SynthDriver):
 			self._snapshotProfile()
 		self.cancel()
 		bgQueue.put((None, None, None))
+		if self._use_helper and self._helper is not None:
+			# Kill the helper before joining the background thread: if the engine ever
+			# hangs mid-utterance, the background thread is blocked reading the helper's
+			# stdout, and joining it first would deadlock NVDA (observed as a lockup
+			# when switching synthesizers). Killing the helper gives that read EOF.
+			try:
+				self._helper.kill()
+			except Exception:
+				pass
 		self.bgThread.join()
 		self._stopEngine()
 		if self.player:

@@ -156,8 +156,14 @@ MMRESULT WINAPI waveOutWriteHook(HWAVEOUT ptr, WAVEHDR* header, UINT size) {
 	if (winmm_hooked_state->async_stop_speaking) return MMSYSERR_NOERROR; // Callback returned false, drop all remaining buffers.
 	short* data = (short*)header->lpData;
 	DWORD data_len = header->dwBufferLength;
+	// The read cap must be in samples, not bytes: passing data_len (bytes) as maxSamples
+	// let sonic write up to twice the engine's buffer when slowing down (output larger
+	// than input), corrupting the heap. Rate boost never hit this (speedup shrinks
+	// output), but the no-command languages drive their whole rate setting through
+	// sonic in both directions. Excess slowdown output stays buffered in the stream and
+	// is drained by the flush loop in waveOutCloseHook.
 	if (winmm_hooked_state->sonic_stream && sonicGetSpeed(winmm_hooked_state->sonic_stream) != 1.0f && sonicWriteShortToStream(winmm_hooked_state->sonic_stream, data, data_len / sizeof(short)))
-		data_len = sonicReadShortFromStream(winmm_hooked_state->sonic_stream, data, data_len) * sizeof(short);
+		data_len = sonicReadShortFromStream(winmm_hooked_state->sonic_stream, data, data_len / sizeof(short)) * sizeof(short);
 	waveOutput(data, data_len);
 	return MMSYSERR_NOERROR;
 }
