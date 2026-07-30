@@ -500,6 +500,19 @@ class SynthDriver(SynthDriver):
 			return format(int(num_str), ",")
 		return re.sub(r"\b\d{5,}\b", replace_num, text)
 
+	# The v2 builds can't apply the ~v1 headsize that classic output rides on by default,
+	# which brightens classic by roughly 8 percent in f0 (measured 128.2 Hz with the full
+	# classic prefix vs 118.2 Hz for v2 at identical settings). Scaling every pitch value
+	# sent to tilde-mode dlls by that amount lands their default where classic sits,
+	# while keeping the relative pitch differences between the custom voices intact.
+	_v2PitchScale = 1.09
+
+	def _pitchValue(self, multiplier=1.0):
+		f = self._pitch * multiplier
+		if self._currentCmdMode() == "tilde":
+			f *= self._v2PitchScale
+		return int(f)
+
 	def speak(self, speechSequence):
 		cmdMode = self._currentCmdMode()
 		useCommands = cmdMode != "none"
@@ -513,7 +526,7 @@ class SynthDriver(SynthDriver):
 					if useCommands: lst.append("~n1,0]")
 					char_mode_on = False
 				if pitch_modified:
-					if useCommands: lst.append(f"~f{self._pitch}]")
+					if useCommands: lst.append(f"~f{self._pitchValue()}]")
 					pitch_modified = False
 			elif isinstance(item, IndexCommand):
 				idx.append(item.index)
@@ -523,8 +536,7 @@ class SynthDriver(SynthDriver):
 			elif isinstance(item,PitchCommand):
 				try: multiplier = item.multiplier
 				except ZeroDevisionError: multiplier = 1
-				f = int(self._pitch * multiplier)
-				if useCommands: lst.append(f"~f{f}]")
+				if useCommands: lst.append(f"~f{self._pitchValue(multiplier)}]")
 		text = " ".join(lst)
 		if self._numberProcessing: text = self._formatNumbers(text)
 		if cmdMode == "classic":
@@ -532,21 +544,41 @@ class SynthDriver(SynthDriver):
 		elif cmdMode == "tilde":
 			# These dlls ignore ~v (headsize) and ~h (inflection); don't send them at all,
 			# so values lingering in nvda.ini from classic sessions can never leak in here.
-			text = f"~r{self._rate}]~e{self._excitation}]~f{self._pitch}]~g{self._volume}]~u{self._unvoicedVolume}]{text} ~|"
+			text = f"~r{self._rate}]~e{self._excitation}]~f{self._pitchValue()}]~g{self._volume}]~u{self._unvoicedVolume}]{text} ~|"
 		# "none" mode: plain text only. Rate is applied via sonic in the speak path and
 		# volume via the player; anything else would be read aloud or vocalized as junk.
 		_execWhenDone(self._speakBg, text, idx, mustBeAsync=True)
 
+	# The engine's measured ~r response (speed factor relative to ~r0), identical within
+	# a few percent on the classic and v2 builds. The documented "percentage of normal
+	# speed" only holds for slow rates; at the fast end the engine compresses hard
+	# (~r-90 is 2.7x, nowhere near the 10x a naive 100/(100+r) mapping suggests), so
+	# "none" command mode languages must follow this curve or they run absurdly fast.
+	_rateCurve = ((200, 0.371), (100, 0.539), (0, 1.0), (-45, 1.660), (-61, 2.113), (-90, 2.711))
+
 	def _rateMultiplier(self):
 		# Rate boost quadruples speed via sonic on every engine. For "none" command mode
 		# languages the engine's own ~r rate command can't be used either, so the whole
-		# rate setting is realized through sonic: the classic rate parameter is a
-		# percentage of normal duration (-90 fastest .. 200 slowest), which maps to a
-		# time stretch factor of 100/(100+rate), clamped to sonic-sane bounds.
+		# rate setting is realized through sonic, following the engine's own curve. A
+		# multiplier of ~1 is returned as exactly 1.0 so sonic stays fully bypassed at
+		# the neutral rate (bare, unprocessed engine output).
 		mult = 4.0 if self._rateBoost else 1.0
 		if self._currentCmdMode() == "none":
-			mult *= max(0.33, min(8.0, 100.0 / (100.0 + self._rate)))
-		return mult
+			r = self._rate
+			pts = self._rateCurve
+			if r >= pts[0][0]:
+				speed = pts[0][1]
+			elif r <= pts[-1][0]:
+				speed = pts[-1][1]
+			else:
+				for (r1, s1), (r2, s2) in zip(pts, pts[1:]):
+					if r2 <= r <= r1:
+						speed = s1 + (s2 - s1) * (r1 - r) / (r1 - r2)
+						break
+			if abs(speed - 1.0) < 0.02:
+				speed = 1.0
+			mult *= speed
+		return max(0.3, min(8.0, mult))
 
 	def _speakBg(self, text, idx):
 		if self._use_helper:
