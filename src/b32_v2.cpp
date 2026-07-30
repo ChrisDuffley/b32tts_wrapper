@@ -16,8 +16,17 @@
 //   true rate, so the wrapper overrides all v2 output to 10800 (see waveOutOpenHook).
 // This is released into the public domain.
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <windows.h>
 #include "b32_state.h"
+
+// Set the B32_DEBUG environment variable to trace chunking decisions on stderr.
+static bool bst_v2_debug() {
+	static int cached = -1;
+	if (cached < 0) cached = getenv("B32_DEBUG")? 1 : 0;
+	return cached == 1;
+}
 
 bool bst_v2_setup(bst_state* s) {
 	s->v2_init = (v2InitFunc)GetProcAddress(s->dll, "Init_TTS");
@@ -36,10 +45,33 @@ bool bst_v2_setup(bst_state* s) {
 // sentence or word boundaries. Inline tilde commands reset on every Say_TTS call
 // (verified: identical audio before and after a commanded utterance), so the leading
 // command run is parsed off and re-applied to every chunk.
+//
+// They also have a fixed 128 byte PHRASE buffer: the frontend accumulates text between
+// punctuation marks to shape prosody, and a punctuation-free stretch that overflows it
+// is dropped in its entirety without a sound (measured: 122 chars speaks, 133 is
+// silent). Mastodon handles and other long unpunctuated runs hit this constantly, and
+// a dot only counts as punctuation when whitespace follows it, so "user.example.com"
+// does not reset the counter. Chunk cuts are therefore also forced so that no chunk
+// contains a punctuation-free run longer than V2_PHRASE_LIMIT; the engine flushes its
+// phrase buffer at end of input, so a mid-sentence chunk end acts as a phrase break.
 #define V2_CHUNK_LIMIT 240
+#define V2_PHRASE_LIMIT 100
 
 static bool bst_v2_is_break(wchar_t c) {
 	return c == L'.' || c == L'!' || c == L'?' || c == L'\n' || c == 0x3002 || c == 0xFF01 || c == 0xFF1F;
+}
+
+static bool bst_v2_is_space(wchar_t c) {
+	return c == L' ' || c == L'\t' || c == L'\n';
+}
+
+// A phrase break the engine actually honors: sentence punctuation or comma, but only
+// when followed by whitespace or end of text.
+static bool bst_v2_phrase_break_at(const wchar_t* text, int len, int i) {
+	wchar_t c = text[i];
+	bool punct = bst_v2_is_break(c) || c == L',' || c == 0x3001 || c == 0xFF0C;
+	if (!punct) return false;
+	return i + 1 >= len || bst_v2_is_space(text[i + 1]);
 }
 
 void bst_v2_speak(bst_state* s, const char* utf8_text) {
@@ -75,6 +107,26 @@ void bst_v2_speak(bst_state* s, const char* utf8_text) {
 	while (pos < content_len && !s->async_stop_speaking) {
 		int remain = content_len - pos;
 		int take = remain <= window? remain : window;
+		// First pass: force a cut before any punctuation-free run can overflow the
+		// engine's phrase buffer. Runs reset at honored phrase breaks; a cut lands at
+		// the last space inside the overlong run (hard mid-word only as a last resort).
+		{
+			int run = 0, run_space = -1, forced = -1;
+			for (int i = 0; i < take; i++) {
+				if (bst_v2_phrase_break_at(content + pos, remain, i)) {
+					run = 0;
+					run_space = -1;
+					continue;
+				}
+				if (bst_v2_is_space(content[pos + i])) run_space = i;
+				run++;
+				if (run >= V2_PHRASE_LIMIT) {
+					forced = run_space > 0? run_space + 1 : i;
+					break;
+				}
+			}
+			if (forced > 0 && forced < take) take = forced;
+		}
 		if (take < remain) {
 			// Prefer to break after sentence punctuation, else at whitespace.
 			int cut = -1;
@@ -101,7 +153,9 @@ void bst_v2_speak(bst_state* s, const char* utf8_text) {
 		memcpy(chunk, wtext, prefix_len * sizeof(wchar_t));
 		memcpy(chunk + prefix_len, content + pos, take * sizeof(wchar_t));
 		chunk[prefix_len + take] = 0;
+		if (bst_v2_debug()) fwprintf(stderr, L"[v2chunk] pos=%d take=%d stop=%d text=%.48s\n", pos, take, (int)s->async_stop_speaking, chunk + prefix_len);
 		s->v2_say(chunk);
+		if (bst_v2_debug()) fwprintf(stderr, L"[v2chunk] said, stop=%d\n", (int)s->async_stop_speaking);
 		pos += take;
 	}
 	free(chunk);
