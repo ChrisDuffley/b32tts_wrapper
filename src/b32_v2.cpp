@@ -107,18 +107,24 @@ void bst_v2_speak(bst_state* s, const char* utf8_text) {
 		int remain = content_len - pos;
 		int take = remain <= window? remain : window;
 		// First pass: force a cut before any punctuation-free run can overflow the
-		// engine's phrase buffer. Runs reset at honored phrase breaks; a cut lands at
-		// the last space inside the overlong run (hard mid-word only as a last resort).
+		// engine's phrase buffer. The buffer holds NORMALIZED text, so characters are
+		// weighted by their expansion: a digit becomes a number word ("9" -> "nine",
+		// six digits of "973520" -> ~60 chars) and URL-ish symbols become words like
+		// "slash". Runs reset at honored phrase breaks; a cut lands at the last space
+		// or URL separator inside the overlong run (hard mid-word as a last resort).
 		{
 			int run = 0, run_space = -1, forced = -1;
 			for (int i = 0; i < take; i++) {
+				wchar_t c = content[pos + i];
 				if (bst_v2_phrase_break_at(content + pos, remain, i)) {
 					run = 0;
 					run_space = -1;
 					continue;
 				}
-				if (bst_v2_is_space(content[pos + i])) run_space = i;
-				run++;
+				if (bst_v2_is_space(c) || c == L'/' || c == L'-' || c == L'_') run_space = i;
+				if (c >= L'0' && c <= L'9') run += 10;
+				else if (c == L'/' || c == L'-' || c == L'_' || c == L':' || c == L'@' || c == L'%' || c == L'#' || c == L'&' || c == L'+' || c == L'=' || c == L'.') run += 6;
+				else run++;
 				if (run >= V2_PHRASE_LIMIT) {
 					forced = run_space > 0? run_space + 1 : i;
 					break;
