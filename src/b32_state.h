@@ -40,6 +40,8 @@ struct bst_state {
 	v2SayFunc v2_say;
 	int sample_rate; // Updated from the format each waveOutOpen provides; classic is 11025, v2 dlls are typically 10000 (Russian is 10800).
 	float pending_rate_multiplier;
+	float bass_lp; // One pole lowpass state for the v2 tone correction shelf.
+	float bass_a;  // Its coefficient, derived from the utterance's sample rate; 0 disables the shelf (classic).
 	bst_async_callback async_callback;
 	void* async_callback_user;
 	bool async_stop_speaking;

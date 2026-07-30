@@ -1,3 +1,4 @@
+import array
 import json
 import os
 import struct
@@ -299,20 +300,25 @@ class SynthDriver(SynthDriver):
 		except:
 			currentSoundcardOutput = config.conf["audio"]["outputDevice"]
 		self.player = nvwave.WavePlayer(1, sampleRate or 11025, 16, outputDevice=currentSoundcardOutput)
-		self._applyPlayerVolume()
 
-	def _applyPlayerVolume(self):
-		# For "none" command mode languages the ~g gain command can't be used, so volume
-		# is applied at the player instead. Other modes keep the player at unity.
-		if not self.player:
-			return
-		try:
-			if self._currentCmdMode() == "none":
-				self.player.setVolume(all=max(0.0, min(1.0, getattr(self, "volume", 100) / 100.0)))
-			else:
-				self.player.setVolume(all=1.0)
-		except Exception:
-			pass
+	def _volumeGainFactor(self):
+		# For "none" command mode languages the ~g gain command can't be used, so the
+		# volume setting is applied as software gain on the pcm instead, following the
+		# same db curve the engine's gain command uses (the volume parameter spans -68
+		# to +12 db). This keeps their loudness in line with the other languages, where
+		# e.g. 100 percent volume means a +12 db engine boost.
+		return 10.0 ** (self._volume / 20.0)
+
+	def _scaleChunk(self, chunk):
+		factor = self._volumeGainFactor()
+		if abs(factor - 1.0) < 0.01:
+			return chunk
+		arr = array.array('h')
+		arr.frombytes(chunk)
+		for i in range(len(arr)):
+			v = int(arr[i] * factor)
+			arr[i] = -32768 if v < -32768 else (32767 if v > 32767 else v)
+		return arr.tobytes()
 
 	def _start_helper(self):
 		# Returns the engine's output sample rate as reported by the helper's startup
@@ -395,7 +401,6 @@ class SynthDriver(SynthDriver):
 
 	def _set_volume(self, vl):
 		self._volume = self._percentToParam(vl,minVolume,maxVolume)
-		self._applyPlayerVolume()
 
 	def _get_volume(self):
 		return self._paramToPercent(self._volume, minVolume, maxVolume)
@@ -500,18 +505,12 @@ class SynthDriver(SynthDriver):
 			return format(int(num_str), ",")
 		return re.sub(r"\b\d{5,}\b", replace_num, text)
 
-	# The v2 builds can't apply the ~v1 headsize that classic output rides on by default,
-	# which brightens classic by roughly 8 percent in f0 (measured 128.2 Hz with the full
-	# classic prefix vs 118.2 Hz for v2 at identical settings). Scaling every pitch value
-	# sent to tilde-mode dlls by that amount lands their default where classic sits,
-	# while keeping the relative pitch differences between the custom voices intact.
-	_v2PitchScale = 1.09
-
 	def _pitchValue(self, multiplier=1.0):
-		f = self._pitch * multiplier
-		if self._currentCmdMode() == "tilde":
-			f *= self._v2PitchScale
-		return int(f)
+		# The deeper character of the v2 voices turned out to be spectral balance, not
+		# fundamental pitch (they carry ~8 percentage points more sub-500hz energy than
+		# classic); that is corrected with a low shelf inside the wrapper, so pitch
+		# values pass through unscaled here.
+		return int(self._pitch * multiplier)
 
 	def speak(self, speechSequence):
 		cmdMode = self._currentCmdMode()
@@ -587,10 +586,15 @@ class SynthDriver(SynthDriver):
 			self._speakBg_dll(text, idx)
 
 	def _speakBg_dll(self, text, idx):
+		applyGain = self._currentCmdMode() == "none"
 		@bst_async_callback
 		def on_audio(data, size, user):
 			if not self.speaking: return False
-			self.player.feed(data, size)
+			if applyGain:
+				chunk = self._scaleChunk(ctypes.string_at(data, size))
+				self.player.feed(chunk, len(chunk))
+			else:
+				self.player.feed(data, size)
 			return True
 		self.speaking = True
 		# As a dirty hack to make indent nav beeps mostly work, indicate that we've reached the first index immedietly.
@@ -615,6 +619,7 @@ class SynthDriver(SynthDriver):
 			synthIndexReached.notify(synth=self, index=idx.pop(0))
 		txt = text.translate(self.table).encode(self._encoding, 'replace')
 		rate_mult = self._rateMultiplier()
+		applyGain = self._currentCmdMode() == "none"
 		log.debug(f"BSTDBG speakBg start len={len(txt)} mult={rate_mult}")
 		# Send SPEAK command: [uint32 text_len][float32 rate_mult][text bytes].
 		# Sent as a single write under the lock so a concurrent cancel from the main
@@ -641,6 +646,8 @@ class SynthDriver(SynthDriver):
 				log.debug("BSTDBG speakBg helper eof mid-chunk")
 				break
 			if self.speaking:
+				if applyGain:
+					chunk = self._scaleChunk(chunk)
 				self.player.feed(chunk, len(chunk))
 				fed += len(chunk)
 			else:

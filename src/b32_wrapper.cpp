@@ -1,6 +1,7 @@
 // Wrapper around Bestspeech/keynote gold to support speaking to a memory buffer instead of waveout. Various constants/parameters/etc are taken from @rommix0's bst.h.
 // This is released into the public domain.
 
+#include <math.h> // expf for the v2 tone correction shelf
 #include <stdio.h> // _snprintf
 #include <windows.h>
 #include "b32_wrapper.h"
@@ -88,6 +89,12 @@ MMRESULT WINAPI waveOutOpenHook(LPHWAVEOUT outptr, UINT device, LPCWAVEFORMATEX 
 	if (!winmm_hooked_state || ((bst_state*)callback != winmm_hooked_state && !winmm_hooked_state->is_v2)) return waveOutOpenProc(outptr, device, format, callback, instance, flags);
 	*outptr = (HWAVEOUT)winmm_hooked_state; // Now all other hooks will receive state information in their first parameter, though we prefer to use winmm_hooked_state. This also makes sure our hook returns a semblance of what the calling function is expecting.
 	winmm_hooked_state->sample_rate = format->nSamplesPerSec;
+	// Tone correction for the v2 dlls: their voice models carry about 8 percentage
+	// points more energy below 500hz than the classic engine at identical settings,
+	// heard as a chesty, boomy character. A gentle -4db low shelf (applied in
+	// waveOutput) brings their spectral balance in line with classic.
+	winmm_hooked_state->bass_lp = 0.0f;
+	winmm_hooked_state->bass_a = winmm_hooked_state->is_v2? 1.0f - expf(-6.2832f * 500.0f / format->nSamplesPerSec) : 0.0f;
 	// Now that the true output format is known, bring the sonic stream in line with it. The v2 language dlls don't all share one sample rate, so this can't be hardcoded.
 	if (winmm_hooked_state->sonic_stream && sonicGetSampleRate(winmm_hooked_state->sonic_stream) != (int)format->nSamplesPerSec) sonicSetSampleRate(winmm_hooked_state->sonic_stream, format->nSamplesPerSec);
 	if (!winmm_hooked_state->sonic_stream && winmm_hooked_state->pending_rate_multiplier != 1.0f) winmm_hooked_state->sonic_stream = sonicCreateStream(format->nSamplesPerSec, 1);
@@ -110,6 +117,18 @@ inline void waveOutput(short* data, DWORD data_len) {
 	// end-of-utterance sentinel, so passing one through would truncate speech and
 	// desync the stream.
 	if (!data_len) return;
+	if (winmm_hooked_state->bass_a > 0.0f) {
+		// The v2 tone correction shelf; see waveOutOpenHook for the rationale. Runs
+		// after sonic so filter state stays continuous over an utterance's chunks.
+		float lp = winmm_hooked_state->bass_lp, a = winmm_hooked_state->bass_a;
+		DWORD n = data_len / sizeof(short);
+		for (DWORD i = 0; i < n; i++) {
+			lp += a * ((float)data[i] - lp);
+			float y = (float)data[i] - 0.369f * lp; // 0.369 = 1 - 10^(-4/20), a -4db cut
+			data[i] = (short)(y < -32768.0f? -32768.0f : (y > 32767.0f? 32767.0f : y));
+		}
+		winmm_hooked_state->bass_lp = lp;
+	}
 	if (winmm_hooked_state->async_callback) {
 		if (!winmm_hooked_state->async_callback((char*)data, data_len, winmm_hooked_state->async_callback_user)) {
 			winmm_hooked_state->async_stop_speaking = true;
