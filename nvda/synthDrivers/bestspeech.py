@@ -13,6 +13,7 @@ import config
 import winUser
 from autoSettingsUtils.driverSetting import DriverSetting, BooleanDriverSetting, NumericDriverSetting
 from autoSettingsUtils.utils import StringParameterInfo
+from . import _bst_numbers
 import re
 import time
 import queue
@@ -543,7 +544,14 @@ class SynthDriver(SynthDriver):
 				except ZeroDevisionError: multiplier = 1
 				if useCommands: lst.append(f"~f{self._pitchValue(multiplier)}]")
 		text = " ".join(lst)
-		if self._numberProcessing: text = self._formatNumbers(text)
+		if cmdMode == "none":
+			# These languages' frontends can't read digits (Japanese and Greek drop them
+			# entirely, Polish only spells them); convert numbers to words in Python.
+			# With number processing off, digits are still made audible, just read out
+			# individually rather than as full numbers.
+			text = _bst_numbers.localizeNumbers(text, self._bstLanguage, self._numberProcessing)
+		elif self._numberProcessing:
+			text = self._formatNumbers(text)
 		if cmdMode == "classic":
 			text = f"~r{self._rate}]~e{self._excitation}]~v{self.headsize}]~f{self._pitch}]~g{self._volume}]~u{self._unvoicedVolume}]~h{self._inflection}]{text} ~|"
 		elif cmdMode == "tilde":
