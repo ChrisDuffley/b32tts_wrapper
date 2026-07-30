@@ -93,11 +93,10 @@ void bst_v2_speak(bst_state* s, const char* utf8_text) {
 	int content_len = total - prefix_len;
 	int window = V2_CHUNK_LIMIT - prefix_len;
 	if (window < 40) window = 40; // degenerate prefix; better to risk a long chunk than emit confetti
-	if (total <= V2_CHUNK_LIMIT) {
-		s->v2_say(wtext);
-		free(wtext);
-		return;
-	}
+	// Note: no short-text fast path here. Even an utterance under the chunk limit must
+	// go through the loop so the phrase-limit scan below can split it; a 130-240 char
+	// stretch without honored punctuation (a URL glued to surrounding words, say)
+	// would otherwise reach the engine whole and get its first phrase silently dropped.
 	wchar_t* chunk = (wchar_t*)malloc((V2_CHUNK_LIMIT + window + 1) * sizeof(wchar_t));
 	if (!chunk) {
 		free(wtext);
@@ -128,10 +127,11 @@ void bst_v2_speak(bst_state* s, const char* utf8_text) {
 			if (forced > 0 && forced < take) take = forced;
 		}
 		if (take < remain) {
-			// Prefer to break after sentence punctuation, else at whitespace.
+			// Prefer to break after sentence punctuation the engine honors (dot inside
+			// a URL or filename doesn't count), else at whitespace.
 			int cut = -1;
 			for (int i = take - 1; i > take / 4; i--) {
-				if (bst_v2_is_break(content[pos + i])) { cut = i + 1; break; }
+				if (bst_v2_is_break(content[pos + i]) && bst_v2_phrase_break_at(content + pos, remain, i)) { cut = i + 1; break; }
 			}
 			if (cut < 0) {
 				for (int i = take - 1; i > take / 4; i--) {
