@@ -104,6 +104,12 @@ MMRESULT WINAPI waveOutPrepareHeaderHook(HWAVEOUT ptr, WAVEHDR* header, UINT siz
 }
 inline void waveOutput(short* data, DWORD data_len) {
 	// winmm_hooked_state is expected to be valid!
+	// Never deliver empty blocks. Sonic legitimately returns 0 samples while it
+	// buffers input for a speed change, and a zero length block must not reach
+	// consumers: the helper's stdout protocol uses a zero length chunk as its
+	// end-of-utterance sentinel, so passing one through would truncate speech and
+	// desync the stream.
+	if (!data_len) return;
 	if (winmm_hooked_state->async_callback) {
 		if (!winmm_hooked_state->async_callback((char*)data, data_len, winmm_hooked_state->async_callback_user)) {
 			winmm_hooked_state->async_stop_speaking = true;

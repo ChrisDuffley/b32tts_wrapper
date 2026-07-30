@@ -58,6 +58,9 @@ static HANDLE            g_cmd_event;
 static bool audio_cb(char* data, long size, void* /*user*/)
 {
     if (g_cancel) return false;
+    // A zero length chunk on stdout means end-of-utterance to our parent; never let
+    // an empty audio block (e.g. from sonic buffering) masquerade as that sentinel.
+    if (size <= 0) return true;
 
     uint32_t len = (uint32_t)size;
     if (fwrite(&len, sizeof(uint32_t), 1, stdout) != 1) return false;

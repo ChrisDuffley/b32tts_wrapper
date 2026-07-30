@@ -535,6 +535,7 @@ class SynthDriver(SynthDriver):
 			synthIndexReached.notify(synth=self, index=idx.pop(0))
 		txt = text.translate(self.table).encode(self._encoding, 'replace')
 		rate_mult = 4.0 if self._rateBoost else 1.0
+		log.debug(f"BSTDBG speakBg start len={len(txt)} mult={rate_mult}")
 		# Send SPEAK command: [uint32 text_len][float32 rate_mult][text bytes].
 		# Sent as a single write under the lock so a concurrent cancel from the main
 		# thread can never splice its bytes into the middle of this command.
@@ -543,25 +544,34 @@ class SynthDriver(SynthDriver):
 				self._helper.stdin.write(struct.pack('<If', len(txt), rate_mult) + txt)
 				self._helper.stdin.flush()
 		except OSError:
+			log.debug("BSTDBG speakBg stdin write failed")
 			return
 		# Read audio chunks until end-of-utterance sentinel (chunk_len == 0).
+		fed = discarded = 0
 		while True:
 			hdr = self._helper_read_exact(4)
 			if hdr is None:
+				log.debug("BSTDBG speakBg helper eof mid-utterance")
 				break
 			chunk_len = struct.unpack('<I', hdr)[0]
 			if chunk_len == 0:
 				break
 			chunk = self._helper_read_exact(chunk_len)
 			if chunk is None:
+				log.debug("BSTDBG speakBg helper eof mid-chunk")
 				break
 			if self.speaking:
 				self.player.feed(chunk, len(chunk))
+				fed += len(chunk)
+			else:
+				discarded += len(chunk)
+		log.debug(f"BSTDBG speakBg sentinel fed={fed} discarded={discarded} speaking={self.speaking}")
 		if not self.speaking:
 			return
 		f = lambda idx=idx: self.done(idx)
 		self.player.feed(b"", 0, onDone=f)
 		self.player.idle()
+		log.debug("BSTDBG speakBg idle done")
 
 	def _helper_read_exact(self, n):
 		buf = b""
@@ -576,6 +586,7 @@ class SynthDriver(SynthDriver):
 		return buf
 
 	def done(self, idx):
+		log.debug(f"BSTDBG done idx={idx}")
 		for i in idx:
 			synthIndexReached.notify(synth=self, index=i)
 		synthDoneSpeaking.notify(synth=self)
@@ -616,6 +627,7 @@ class SynthDriver(SynthDriver):
 				pass
 
 	def cancel(self):
+		log.debug("BSTDBG cancel")
 		self.speaking = False
 		while True:
 			try:
