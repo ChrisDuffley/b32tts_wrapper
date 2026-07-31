@@ -7,6 +7,7 @@ sonic = env.Object("obj/sonic", "obj/sonic.c", CPPDEFINES = [("SONIC_MIN_PITCH",
 env.SharedLibrary("bin/b32_wrapper", ["obj/b32_wrapper.cpp", "obj/b32_v2.cpp", sonic], LIBS = ["user32", "winmm", "bin/MinHook"])
 env.Program("bin/test", "obj/test.cpp", LIBS = ["user32", "winmm", "bin/b32_wrapper"])
 env.Program("bin/test_rapid", "obj/test_rapid.cpp", LIBS = ["user32", "winmm", "bin/b32_wrapper"])
+env.Program("bin/test_multi", "obj/test_multi.cpp", LIBS = ["user32", "winmm", "bin/b32_wrapper"])
 b32_wrapper_static = env.Object("obj/b32_wrapper_static", "obj/b32_wrapper.cpp", CPPDEFINES = [("b32w_export", "")])
 b32_v2_static = env.Object("obj/b32_v2_static", "obj/b32_v2.cpp", CPPDEFINES = [("b32w_export", "")])
 env.Program("bin/b32_spk", ["obj/argparse.c", b32_wrapper_static, b32_v2_static, "obj/b32_spk.cpp", sonic], CPPDEFINES = [("b32w_export", "")], LIBS = ["user32", "winmm", "bin/MinHook"])

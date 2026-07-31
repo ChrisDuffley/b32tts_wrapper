@@ -5,7 +5,7 @@ import struct
 import subprocess
 from collections import OrderedDict
 from synthDriverHandler import SynthDriver, synthIndexReached, synthDoneSpeaking, VoiceInfo
-from speech.commands import IndexCommand, PitchCommand, CharacterModeCommand
+from speech.commands import IndexCommand, PitchCommand, CharacterModeCommand, LangChangeCommand
 import ctypes
 from ctypes import c_char_p, c_void_p, c_long, c_float, c_wchar_p, byref, POINTER, CFUNCTYPE
 import nvwave
@@ -158,6 +158,160 @@ def _execWhenDone(func, *args, mustBeAsync=False, **kwargs):
 	else:
 		func(*args, **kwargs)
 
+class _Engine:
+	"""One initialized engine, driving a single language dll.
+
+	Automatic language switching needs a different engine part way through an utterance,
+	so an engine is kept alive for every language that gets spoken rather than being torn
+	down and reloaded on each switch: a reload costs a dll load plus the warmup synthesis,
+	which would be audible as a gap in the middle of a sentence. Engines run in process
+	through b32_wrapper.dll where that is possible and out of process through the 32 bit
+	b32_helper.exe otherwise (e.g. a 32 bit dll under 64 bit NVDA 2026+). Everything here
+	runs on the background speech thread; see the note in SynthDriver.__init__ about why
+	the classic engine must never be touched from NVDA's main thread.
+	"""
+
+	def __init__(self, basePath, langId, wrapperDll):
+		label, dllName, nvdaLang, encoding, cmdMode = languages[langId]
+		self.langId = langId
+		self.encoding = encoding
+		self.cmdMode = cmdMode
+		self.sampleRate = None
+		self.handle = None
+		self.helper = None
+		self._basePath = basePath
+		self._dllPath = os.path.join(basePath, dllName)
+		self._dll = wrapperDll
+		# The helper's stdin is written from both NVDA's main thread (cancel) and the
+		# background speech thread (speak). Without a lock those writes can interleave
+		# mid-command, corrupting the protocol framing, which surfaces as truncated
+		# utterances and speech that queues instead of cancelling.
+		self._lock = threading.Lock()
+
+	def open(self):
+		"""Starts the engine, in process if b32_wrapper.dll is usable and through the
+		helper otherwise. Returns True if it is ready to speak."""
+		if self._dll is not None and self._openInProcess():
+			return True
+		self.sampleRate = self._startHelper()
+		return self.sampleRate is not None
+
+	def _openInProcess(self):
+		try:
+			self.handle = self._dll.bst_init_w(self._dllPath)
+			if not self.handle:
+				raise OSError(f"bst_init failed for {self._dllPath}")
+			# Warmup utterance so the wrapper learns the engine's true output sample rate
+			# (the v2 language dlls don't all share one; e.g. Russian is 10800 hz).
+			size = c_long(0)
+			buf = self._dll.bst_speak(self.handle, byref(size), b"a", -1, 0, c_float(1.0), 0, False)
+			if buf: self._dll.bst_speech_free(buf)
+			self.sampleRate = self._dll.bst_get_sample_rate(c_void_p(self.handle))
+			return True
+		except (OSError, AttributeError):
+			log.debug("bestspeech: %s could not be started in process" % self._dllPath, exc_info=True)
+			# The engine may already be up and only the warmup have failed; don't leave
+			# it loaded, since open() falls through to the helper from here.
+			if self.handle:
+				self._dll.bst_free(c_void_p(self.handle))
+			self.handle = None
+			return False
+
+	def _startHelper(self):
+		# Returns the engine's output sample rate as reported by the helper's startup
+		# handshake, or None if the helper could not be started.
+		helperPath = os.path.join(self._basePath, 'b32_helper.exe')
+		try:
+			self.helper = subprocess.Popen(
+				[helperPath, self._dllPath],
+				stdin=subprocess.PIPE,
+				stdout=subprocess.PIPE,
+				stderr=subprocess.DEVNULL,
+				creationflags=subprocess.CREATE_NO_WINDOW
+			)
+		except OSError:
+			log.error("bestspeech: could not launch the helper for %s" % self._dllPath, exc_info=True)
+			self.helper = None
+			return None
+		hdr = self.readExact(8)
+		if hdr is None:
+			log.error("bestspeech helper died during startup for %s" % self._dllPath)
+			return None
+		magic, sampleRate = struct.unpack('<II', hdr)
+		if magic != 0xFFFFFFFE:
+			log.error("bestspeech helper sent unexpected handshake %#x" % magic)
+			return None
+		return sampleRate
+
+	def restartHelper(self):
+		"""Brings the helper back after it died unexpectedly. The sample rate is that of
+		the same dll as before, so the player it feeds stays valid."""
+		self.helper = None
+		return self._startHelper() is not None
+
+	def sendSpeak(self, txt, rateMultiplier):
+		# SPEAK command: [uint32 text_len][float32 rate_mult][text bytes]. Sent as a
+		# single write under the lock so a concurrent cancel from the main thread can
+		# never splice its bytes into the middle of this command.
+		try:
+			with self._lock:
+				self.helper.stdin.write(struct.pack('<If', len(txt), rateMultiplier) + txt)
+				self.helper.stdin.flush()
+			return True
+		except OSError:
+			log.debug("BSTDBG speakBg stdin write failed")
+			return False
+
+	def readExact(self, n):
+		buf = b""
+		while len(buf) < n:
+			try:
+				chunk = self.helper.stdout.read(n - len(buf))
+			except OSError:
+				return None
+			if not chunk:
+				return None
+			buf += chunk
+		return buf
+
+	def cancel(self):
+		if self.helper is None:
+			return
+		# CANCEL command: text_len == 0.
+		try:
+			with self._lock:
+				self.helper.stdin.write(struct.pack('<I', 0))
+				self.helper.stdin.flush()
+		except OSError:
+			pass
+
+	def kill(self):
+		if self.helper is not None:
+			try:
+				self.helper.kill()
+			except Exception:
+				pass
+
+	def close(self):
+		if self.helper is not None:
+			# QUIT command, then wait for a clean exit.
+			try:
+				with self._lock:
+					self.helper.stdin.write(struct.pack('<I', 0xFFFFFFFF))
+					self.helper.stdin.flush()
+			except OSError:
+				pass
+			try:
+				self.helper.wait(timeout=2)
+			except subprocess.TimeoutExpired:
+				pass
+			if self.helper.poll() is None:
+				self.helper.kill()
+			self.helper = None
+		elif self.handle:
+			self._dll.bst_free(c_void_p(self.handle))
+			self.handle = None
+
 class SynthDriver(SynthDriver):
 	name = 'bestspeech'
 	description = 'Bestspeech'
@@ -197,7 +351,7 @@ class SynthDriver(SynthDriver):
 			return self._allSupportedSettings
 		return tuple(s for s in self._allSupportedSettings if s.id not in dead)
 	supportedNotifications = {synthIndexReached, synthDoneSpeaking}
-	supportedCommands = {PitchCommand, CharacterModeCommand, IndexCommand}
+	supportedCommands = {PitchCommand, CharacterModeCommand, IndexCommand, LangChangeCommand}
 
 	@classmethod
 	def check(cls):
@@ -207,16 +361,15 @@ class SynthDriver(SynthDriver):
 		super().__init__()
 		_patchVoicePanelLanguageRefresh()
 		self._basePath = os.path.dirname(__file__)
-		self.player = None
-		self._helper = None
-		# The helper's stdin is written from both NVDA's main thread (cancel) and the
-		# background speech thread (speak). Without a lock those writes can interleave
-		# mid-command, corrupting the protocol framing, which surfaces as truncated
-		# utterances and speech that queues instead of cancelling.
-		self._helperLock = threading.Lock()
 		self.dll = None
-		self.handle = None
-		self._use_helper = False
+		self._wrapperLoadAttempted = False
+		# Engines that have been used, most recently used last, and the languages whose
+		# engine failed to start (so we don't try to load a broken dll on every utterance).
+		self._engines = OrderedDict()
+		self._badLanguages = set()
+		# One player per engine sample rate; the classic engine is 11025 hz and the v2
+		# dlls 10800, and automatic language switching can hit both in one utterance.
+		self._players = {}
 		# Only offer languages whose engine dll is actually present next to this driver.
 		self._availableBstLanguages = OrderedDict()
 		for langId, (label, dllName, nvdaLang, encoding, cmdMode) in languages.items():
@@ -258,16 +411,19 @@ class SynthDriver(SynthDriver):
 		self.table = str.maketrans("\u2019", "'")
 		self.canceled = False
 
+	# How many engines stay loaded at once. Automatic language switching only juggles a
+	# couple of languages in practice, and each one held open costs a loaded dll or a
+	# helper process, so the least recently used engine beyond this is dropped.
+	_maxLoadedEngines = 4
+
 	def _initEngine(self):
-		# (Re)starts the engine for the currently selected language, either in-process or
-		# via the 32-bit helper, then creates a player matching the engine's sample rate.
-		label, dllName, nvdaLang, encoding, cmdMode = languages[self._bstLanguage]
-		self._dll_path = os.path.join(self._basePath, dllName)
-		self._encoding = encoding
-		wrapper_path = os.path.join(self._basePath, 'b32_wrapper.dll')
-		sampleRate = None
-		try:
-			if self.dll is None:
+		# Loads b32_wrapper.dll for in process synthesis, then warms up the engine and
+		# player for the currently selected language so the first utterance isn't
+		# delayed by them.
+		if not self._wrapperLoadAttempted:
+			self._wrapperLoadAttempted = True
+			wrapper_path = os.path.join(self._basePath, 'b32_wrapper.dll')
+			try:
 				self.dll = ctypes.cdll[wrapper_path]
 				self.dll.bst_init_w.argtypes = (ctypes.c_wchar_p,)
 				self.dll.bst_init_w.restype = c_void_p
@@ -277,48 +433,73 @@ class SynthDriver(SynthDriver):
 				self.dll.bst_speak.restype = c_void_p
 				self.dll.bst_speech_free.argtypes = (c_void_p,)
 				self.dll.bst_get_sample_rate.argtypes = (c_void_p,)
-			self.handle = self.dll.bst_init_w(self._dll_path)
-			if not self.handle:
-				raise OSError(f"bst_init failed for {self._dll_path}")
-			# Warmup utterance so the wrapper learns the engine's true output sample rate
-			# (the v2 language dlls don't all share one; e.g. Russian is 10800 hz).
-			size = c_long(0)
-			buf = self.dll.bst_speak(self.handle, byref(size), b"a", -1, 0, c_float(1.0), 0, False)
-			if buf: self.dll.bst_speech_free(buf)
-			sampleRate = self.dll.bst_get_sample_rate(c_void_p(self.handle))
-			self._use_helper = False
-		except (OSError, AttributeError):
-			# b32_wrapper.dll could not be loaded in-process (e.g. 32-bit DLL in
-			# 64-bit NVDA 2026+, or DLL simply absent). Fall back to the
-			# out-of-process 32-bit helper.
-			self.dll = None
-			self.handle = None
-			self._use_helper = True
-			sampleRate = self._start_helper()
-		self._createPlayer(sampleRate)
+			except (OSError, AttributeError):
+				# b32_wrapper.dll could not be loaded in-process (e.g. 32-bit DLL in
+				# 64-bit NVDA 2026+, or DLL simply absent). Every engine falls back to
+				# the out-of-process 32-bit helper.
+				self.dll = None
+		engine = self._getEngine(self._bstLanguage)
+		if engine is not None:
+			self._getPlayer(engine.sampleRate)
 
-	def _createPlayer(self, sampleRate):
-		if self.player:
+	def _getEngine(self, langId):
+		# Returns a ready engine for langId, starting one if this language hasn't been
+		# spoken yet, or None if it can't be started. Background speech thread only.
+		engine = self._engines.get(langId)
+		if engine is not None:
+			self._engines.move_to_end(langId)
+			return engine
+		if langId in self._badLanguages:
+			return None
+		engine = _Engine(self._basePath, langId, self.dll)
+		if not engine.open():
+			engine.close()
+			self._badLanguages.add(langId)
+			log.error("bestspeech: could not start the %s engine" % langId)
+			return None
+		self._engines[langId] = engine
+		# Evict down to the cap, never the selected language or the one just started.
+		while len(self._engines) > self._maxLoadedEngines:
+			for victim in list(self._engines):
+				if victim != langId and victim != self._bstLanguage:
+					self._engines.pop(victim).close()
+					break
+			else:
+				break
+		return engine
+
+	def _getPlayer(self, sampleRate):
+		rate = sampleRate or 11025
+		player = self._players.get(rate)
+		if player is None:
 			try:
-				self.player.close()
-			except Exception:
-				pass
-		try:
-			currentSoundcardOutput = config.conf['speech']['outputDevice']
-		except:
-			currentSoundcardOutput = config.conf["audio"]["outputDevice"]
-		self.player = nvwave.WavePlayer(1, sampleRate or 11025, 16, outputDevice=currentSoundcardOutput)
+				currentSoundcardOutput = config.conf['speech']['outputDevice']
+			except:
+				currentSoundcardOutput = config.conf["audio"]["outputDevice"]
+			player = nvwave.WavePlayer(1, rate, 16, outputDevice=currentSoundcardOutput)
+			self._players[rate] = player
+		return player
 
-	def _volumeGainFactor(self):
+	def _volumeParam(self, langId):
+		# The v2 dlls are far quieter than the classic engine (Russian peaks below 20
+		# percent of full scale), which is why their default volume is 100 against the
+		# classic engine's 85: twelve db apart in this driver's parameter space. When
+		# automatic language switching drops a stretch of text on the other engine
+		# family, apply that offset so the sentence doesn't change loudness half way.
+		volume = self._volume
+		if (langId == "classic") != (self._bstLanguage == "classic"):
+			volume += -12 if langId == "classic" else 12
+		return max(minVolume, min(maxVolume, volume))
+
+	def _volumeGainFactor(self, langId):
 		# For "none" command mode languages the ~g gain command can't be used, so the
 		# volume setting is applied as software gain on the pcm instead, following the
 		# same db curve the engine's gain command uses (the volume parameter spans -68
 		# to +12 db). This keeps their loudness in line with the other languages, where
 		# e.g. 100 percent volume means a +12 db engine boost.
-		return 10.0 ** (self._volume / 20.0)
+		return 10.0 ** (self._volumeParam(langId) / 20.0)
 
-	def _scaleChunk(self, chunk):
-		factor = self._volumeGainFactor()
+	def _scaleChunk(self, chunk, factor):
 		if abs(factor - 1.0) < 0.01:
 			return chunk
 		arr = array.array('h')
@@ -327,27 +508,6 @@ class SynthDriver(SynthDriver):
 			v = int(arr[i] * factor)
 			arr[i] = -32768 if v < -32768 else (32767 if v > 32767 else v)
 		return arr.tobytes()
-
-	def _start_helper(self):
-		# Returns the engine's output sample rate as reported by the helper's startup
-		# handshake, or None if the helper could not be started.
-		helper_path = os.path.join(self._basePath, 'b32_helper.exe')
-		self._helper = subprocess.Popen(
-			[helper_path, self._dll_path],
-			stdin=subprocess.PIPE,
-			stdout=subprocess.PIPE,
-			stderr=subprocess.DEVNULL,
-			creationflags=subprocess.CREATE_NO_WINDOW
-		)
-		hdr = self._helper_read_exact(8)
-		if hdr is None:
-			log.error("bestspeech helper died during startup for %s" % self._dll_path)
-			return None
-		magic, sampleRate = struct.unpack('<II', hdr)
-		if magic != 0xFFFFFFFE:
-			log.error("bestspeech helper sent unexpected handshake %#x" % magic)
-			return None
-		return sampleRate
 
 	def loadSettings(self, onlyChanged = False):
 		# We can probably remove this in a bit, we override this to make sure people's excitation setting doesn't break across addon versions.
@@ -482,13 +642,11 @@ class SynthDriver(SynthDriver):
 				ring.updateSupportedSettings(self)
 		except Exception:
 			log.debug("bestspeech: could not refresh synth settings ring", exc_info=True)
-		# The actual restart runs on the background thread, where all other engine access
-		# happens, so we can never tear the engine down under an in-progress utterance.
-		_execWhenDone(self._switchEngineBg, mustBeAsync=True)
-
-	def _switchEngineBg(self):
-		self._stopEngine()
-		self._initEngine()
+		# Warming up the new language's engine runs on the background thread, where all
+		# other engine access happens, so we can never load a dll under an in-progress
+		# utterance. The engine we were using stays loaded and is reused if the user (or
+		# automatic language switching) comes back to it.
+		_execWhenDone(self._initEngine, mustBeAsync=True)
 
 	def _get_bstlanguage(self):
 		return self._bstLanguage
@@ -498,6 +656,31 @@ class SynthDriver(SynthDriver):
 
 	def _get_language(self):
 		return languages[self._bstLanguage][2]
+
+	def _get_availableLanguages(self):
+		# NVDA asks the synthesizer which languages it can speak to decide whether a
+		# stretch of text needs the "not supported" report. Without this the base
+		# implementation collects the language of each VoiceInfo, which this driver
+		# leaves unset (voices are speaker characters, not languages), so every
+		# language came back unsupported and nothing ever switched.
+		return {languages[langId][2] for langId in self._availableBstLanguages}
+
+	def _languageForNvdaLang(self, lang):
+		# Maps the language code NVDA reports for a stretch of text onto one of the
+		# engine languages we have a dll for. There is one dll per language, so dialects
+		# are matched on their base code (en_GB and en_US are both just English), and
+		# anything we can't speak stays on the selected language.
+		if not lang:
+			return self._bstLanguage
+		base = lang.replace("-", "_").split("_")[0].lower()
+		# Stay put when the selected language already speaks it, so an English stretch in
+		# a French document doesn't jump off whichever English engine the user chose.
+		if languages[self._bstLanguage][2] == base:
+			return self._bstLanguage
+		for langId in self._availableBstLanguages:
+			if languages[langId][2] == base:
+				return langId
+		return self._bstLanguage
 
 	def _set_voice(self, vl):
 		if not vl in voices: return
@@ -535,12 +718,12 @@ class SynthDriver(SynthDriver):
 		"jpn": "てん",
 	}
 
-	def _normalizeDecimals(self, text):
-		word = self._decimalWords.get(self._bstLanguage, "point")
+	def _normalizeDecimals(self, text, langId):
+		word = self._decimalWords.get(langId, "point")
 		return re.sub(r"(?<=\d)\.(?=\d)", f" {word} ", text)
 
-	def _formatNumbers(self, text):
-		sep = self._numberSeparators.get(self._bstLanguage, ",")
+	def _formatNumbers(self, text, langId):
+		sep = self._numberSeparators.get(langId, ",")
 		def replace_num(m):
 			grouped = format(int(m.group(0)), ",")
 			return grouped if sep == "," else grouped.replace(",", sep)
@@ -554,13 +737,48 @@ class SynthDriver(SynthDriver):
 		return int(self._pitch * multiplier)
 
 	def speak(self, speechSequence):
-		cmdMode = self._currentCmdMode()
+		# Automatic language switching hands us LangChangeCommands part way through the
+		# sequence. Split it into runs of a single engine language; each run is built and
+		# synthesized on its own engine, in order, by the background thread.
+		runs = []
+		langId = self._bstLanguage
+		items = []
+		for item in speechSequence:
+			if isinstance(item, LangChangeCommand):
+				newLangId = self._languageForNvdaLang(item.lang)
+				if newLangId != langId:
+					if items:
+						runs.append((langId, items))
+						items = []
+					langId = newLangId
+				continue
+			items.append(item)
+		if items or not runs:
+			runs.append((langId, items))
+		batch = []
+		charMode = False
+		for runLang, runItems in runs:
+			text, idx, charMode = self._buildRun(runLang, runItems, charMode)
+			batch.append((runLang, text, idx))
+		_execWhenDone(self._speakBg, batch, mustBeAsync=True)
+
+	def _buildRun(self, langId, items, charMode=False):
+		# Turns one single-language run of a speech sequence into the text to hand that
+		# language's engine, plus the indexes it contains. Character mode is carried in
+		# and out because a language change can land in the middle of spelled text.
+		# A run with nothing to say (a lone index, or a language change NVDA reports but
+		# never puts text in) comes back with text None, so it can't cost an engine load.
+		cmdMode = languages[langId][4]
 		useCommands = cmdMode != "none"
 		lst = ["~n10,0]" if self._abbreviations else "~n10,1]", "~~1,0]" if self._phrasePrediction else "~~1,1]"] if useCommands else []
+		if charMode and useCommands: lst.append("~n1,1]")
 		idx = []
-		char_mode_on = pitch_modified = False
-		for item in speechSequence:
+		spoken = False
+		char_mode_on = charMode
+		pitch_modified = False
+		for item in items:
 			if isinstance(item, str):
+				spoken = spoken or bool(item.strip())
 				lst.append(item)
 				if char_mode_on:
 					if useCommands: lst.append("~n1,0]")
@@ -581,7 +799,7 @@ class SynthDriver(SynthDriver):
 		# Collapse whitespace runs: layout padding counts toward the v2 dlls' 128 byte
 		# phrase buffer, needlessly forcing mid-sentence chunk cuts (and their pauses).
 		text = re.sub(r"\s{2,}", " ", text)
-		text = self._normalizeDecimals(text)
+		text = self._normalizeDecimals(text, langId)
 		if cmdMode != "classic":
 			# Two v2 frontend quirks. Its normalizer expands apostrophe-s into "is",
 			# so possessives read as "Ivan is"; dropping just the apostrophe gives the
@@ -596,18 +814,19 @@ class SynthDriver(SynthDriver):
 			# entirely, Polish only spells them); convert numbers to words in Python.
 			# With number processing off, digits are still made audible, just read out
 			# individually rather than as full numbers.
-			text = _bst_numbers.localizeNumbers(text, self._bstLanguage, self._numberProcessing)
+			text = _bst_numbers.localizeNumbers(text, langId, self._numberProcessing)
 		elif self._numberProcessing:
-			text = self._formatNumbers(text)
+			text = self._formatNumbers(text, langId)
+		volume = self._volumeParam(langId)
 		if cmdMode == "classic":
-			text = f"~r{self._rate}]~e{self._excitation}]~v{self.headsize}]~f{self._pitch}]~g{self._volume}]~u{self._unvoicedVolume}]~h{self._inflection}]{text} ~|"
+			text = f"~r{self._rate}]~e{self._excitation}]~v{self.headsize}]~f{self._pitch}]~g{volume}]~u{self._unvoicedVolume}]~h{self._inflection}]{text} ~|"
 		elif cmdMode == "tilde":
 			# These dlls ignore ~v (headsize) and ~h (inflection); don't send them at all,
 			# so values lingering in nvda.ini from classic sessions can never leak in here.
-			text = f"~r{self._rate}]~e{self._excitation}]~f{self._pitchValue()}]~g{self._volume}]~u{self._unvoicedVolume}]{text} ~|"
+			text = f"~r{self._rate}]~e{self._excitation}]~f{self._pitchValue()}]~g{volume}]~u{self._unvoicedVolume}]{text} ~|"
 		# "none" mode: plain text only. Rate is applied via sonic in the speak path and
 		# volume via the player; anything else would be read aloud or vocalized as junk.
-		_execWhenDone(self._speakBg, text, idx, mustBeAsync=True)
+		return (text if spoken else None), idx, char_mode_on
 
 	# The engine's measured ~r response (speed factor relative to ~r0), identical within
 	# a few percent on the classic and v2 builds. The documented "percentage of normal
@@ -616,14 +835,14 @@ class SynthDriver(SynthDriver):
 	# "none" command mode languages must follow this curve or they run absurdly fast.
 	_rateCurve = ((200, 0.371), (100, 0.539), (0, 1.0), (-45, 1.660), (-61, 2.113), (-90, 2.711))
 
-	def _rateMultiplier(self):
+	def _rateMultiplier(self, langId):
 		# Rate boost quadruples speed via sonic on every engine. For "none" command mode
 		# languages the engine's own ~r rate command can't be used either, so the whole
 		# rate setting is realized through sonic, following the engine's own curve. A
 		# multiplier of ~1 is returned as exactly 1.0 so sonic stays fully bypassed at
 		# the neutral rate (bare, unprocessed engine output).
 		mult = 4.0 if self._rateBoost else 1.0
-		if self._currentCmdMode() == "none":
+		if languages[langId][4] == "none":
 			r = self._rate
 			pts = self._rateCurve
 			if r >= pts[0][0]:
@@ -640,125 +859,108 @@ class SynthDriver(SynthDriver):
 			mult *= speed
 		return max(0.3, min(8.0, mult))
 
-	def _speakBg(self, text, idx):
-		if self._use_helper:
-			self._speakBg_helper(text, idx)
-		else:
-			self._speakBg_dll(text, idx)
+	def _speakBg(self, batch):
+		# Speaks the runs of one utterance back to back. Runs can land on engines with
+		# different sample rates (the classic engine is 11025 hz, the v2 dlls 10800), so
+		# each rate has its own player and the previous one is drained before the next
+		# starts, or the two halves of the sentence would play over each other.
+		self.speaking = True
+		# As a dirty hack to make indent nav beeps mostly work, indicate that we've reached the first index immedietly.
+		if sum(len(idx) for langId, text, idx in batch) > 1:
+			for langId, text, idx in batch:
+				if idx:
+					synthIndexReached.notify(synth=self, index=idx.pop(0))
+					break
+		player = None
+		pendingIdx = []
+		for langId, text, idx in batch:
+			if not self.speaking: return
+			pendingIdx.extend(idx)
+			if text is None: continue
+			engine = self._getEngine(langId)
+			if engine is None: continue
+			# Starting an engine can take long enough for a cancel to land during it.
+			if not self.speaking: return
+			nextPlayer = self._getPlayer(engine.sampleRate)
+			if player is not None and nextPlayer is not player:
+				player.idle()
+			player = nextPlayer
+			if engine.helper is not None:
+				self._speakRun_helper(engine, text, player)
+			else:
+				self._speakRun_dll(engine, text, player)
+			if not self.speaking: return
+			if pendingIdx:
+				player.feed(b"", 0, onDone=lambda idx=pendingIdx: self._notifyIndexes(idx))
+				pendingIdx = []
+		if player is None:
+			# Nothing could be synthesized, but NVDA still has to hear that we're done.
+			self.done(pendingIdx)
+			return
+		player.feed(b"", 0, onDone=lambda idx=pendingIdx: self.done(idx))
+		player.idle()
+		log.debug("BSTDBG speakBg idle done")
 
-	def _speakBg_dll(self, text, idx):
-		applyGain = self._currentCmdMode() == "none"
+	def _speakRun_dll(self, engine, text, player):
+		gain = self._volumeGainFactor(engine.langId) if engine.cmdMode == "none" else None
 		@bst_async_callback
 		def on_audio(data, size, user):
 			if not self.speaking: return False
-			if applyGain:
-				chunk = self._scaleChunk(ctypes.string_at(data, size))
-				self.player.feed(chunk, len(chunk))
+			if gain is not None:
+				chunk = self._scaleChunk(ctypes.string_at(data, size), gain)
+				player.feed(chunk, len(chunk))
 			else:
-				self.player.feed(data, size)
+				player.feed(data, size)
 			return True
-		self.speaking = True
-		# As a dirty hack to make indent nav beeps mostly work, indicate that we've reached the first index immedietly.
-		if idx and len(idx) > 1:
-			synthIndexReached.notify(synth=self, index=idx.pop(0))
-		txt = text.translate(self.table).encode(self._encoding, 'replace')
-		self.dll.bst_speak_async(self.handle, on_audio, None, txt, -1, 0, c_float(self._rateMultiplier()), 0)
-		if not self.speaking: return
-		f = lambda idx=idx: self.done(idx)
-		self.player.feed(b"", 0, onDone=f)
-		self.player.idle()
+		txt = text.translate(self.table).encode(engine.encoding, 'replace')
+		self.dll.bst_speak_async(engine.handle, on_audio, None, txt, -1, 0, c_float(self._rateMultiplier(engine.langId)), 0)
 
-	def _speakBg_helper(self, text, idx):
+	def _speakRun_helper(self, engine, text, player):
 		# Restart helper if it died unexpectedly.
-		if self._helper is None or self._helper.poll() is not None:
-			sampleRate = self._start_helper()
-			if sampleRate:
-				self._createPlayer(sampleRate)
-		self.speaking = True
-		# As a dirty hack to make indent nav beeps mostly work, indicate that we've reached the first index immedietly.
-		if idx and len(idx) > 1:
-			synthIndexReached.notify(synth=self, index=idx.pop(0))
-		txt = text.translate(self.table).encode(self._encoding, 'replace')
-		rate_mult = self._rateMultiplier()
-		applyGain = self._currentCmdMode() == "none"
-		log.debug(f"BSTDBG speakBg start len={len(txt)} mult={rate_mult}")
-		# Send SPEAK command: [uint32 text_len][float32 rate_mult][text bytes].
-		# Sent as a single write under the lock so a concurrent cancel from the main
-		# thread can never splice its bytes into the middle of this command.
-		try:
-			with self._helperLock:
-				self._helper.stdin.write(struct.pack('<If', len(txt), rate_mult) + txt)
-				self._helper.stdin.flush()
-		except OSError:
-			log.debug("BSTDBG speakBg stdin write failed")
+		if engine.helper.poll() is not None and not engine.restartHelper():
+			return
+		txt = text.translate(self.table).encode(engine.encoding, 'replace')
+		rate_mult = self._rateMultiplier(engine.langId)
+		gain = self._volumeGainFactor(engine.langId) if engine.cmdMode == "none" else None
+		log.debug(f"BSTDBG speakBg start lang={engine.langId} len={len(txt)} mult={rate_mult}")
+		if not engine.sendSpeak(txt, rate_mult):
 			return
 		# Read audio chunks until end-of-utterance sentinel (chunk_len == 0).
 		fed = discarded = 0
 		while True:
-			hdr = self._helper_read_exact(4)
+			hdr = engine.readExact(4)
 			if hdr is None:
 				log.debug("BSTDBG speakBg helper eof mid-utterance")
 				break
 			chunk_len = struct.unpack('<I', hdr)[0]
 			if chunk_len == 0:
 				break
-			chunk = self._helper_read_exact(chunk_len)
+			chunk = engine.readExact(chunk_len)
 			if chunk is None:
 				log.debug("BSTDBG speakBg helper eof mid-chunk")
 				break
 			if self.speaking:
-				if applyGain:
-					chunk = self._scaleChunk(chunk)
-				self.player.feed(chunk, len(chunk))
+				if gain is not None:
+					chunk = self._scaleChunk(chunk, gain)
+				player.feed(chunk, len(chunk))
 				fed += len(chunk)
 			else:
 				discarded += len(chunk)
 		log.debug(f"BSTDBG speakBg sentinel fed={fed} discarded={discarded} speaking={self.speaking}")
-		if not self.speaking:
-			return
-		f = lambda idx=idx: self.done(idx)
-		self.player.feed(b"", 0, onDone=f)
-		self.player.idle()
-		log.debug("BSTDBG speakBg idle done")
 
-	def _helper_read_exact(self, n):
-		buf = b""
-		while len(buf) < n:
-			try:
-				chunk = self._helper.stdout.read(n - len(buf))
-			except OSError:
-				return None
-			if not chunk:
-				return None
-			buf += chunk
-		return buf
+	def _notifyIndexes(self, idx):
+		for i in idx:
+			synthIndexReached.notify(synth=self, index=i)
 
 	def done(self, idx):
 		log.debug(f"BSTDBG done idx={idx}")
-		for i in idx:
-			synthIndexReached.notify(synth=self, index=i)
+		self._notifyIndexes(idx)
 		synthDoneSpeaking.notify(synth=self)
 
-	def _stopEngine(self):
-		if self._use_helper:
-			if self._helper is not None:
-				# Send QUIT command then wait for clean exit.
-				try:
-					with self._helperLock:
-						self._helper.stdin.write(struct.pack('<I', 0xFFFFFFFF))
-						self._helper.stdin.flush()
-				except OSError:
-					pass
-				try:
-					self._helper.wait(timeout=2)
-				except subprocess.TimeoutExpired:
-					pass
-				if self._helper.poll() is None:
-					self._helper.kill()
-				self._helper = None
-		elif self.dll is not None and self.handle:
-			self.dll.bst_free(c_void_p(self.handle))
-			self.handle = None
+	def _stopEngines(self):
+		for engine in list(self._engines.values()):
+			engine.close()
+		self._engines.clear()
 
 	def terminate(self):
 		# Remember this language's parameters for next session before shutting down.
@@ -766,22 +968,20 @@ class SynthDriver(SynthDriver):
 			self._snapshotProfile()
 		self.cancel()
 		bgQueue.put((None, None, None))
-		if self._use_helper and self._helper is not None:
-			# Kill the helper before joining the background thread: if the engine ever
-			# hangs mid-utterance, the background thread is blocked reading the helper's
-			# stdout, and joining it first would deadlock NVDA (observed as a lockup
-			# when switching synthesizers). Killing the helper gives that read EOF.
-			try:
-				self._helper.kill()
-			except Exception:
-				pass
+		# Kill the helpers before joining the background thread: if an engine ever hangs
+		# mid-utterance, the background thread is blocked reading that helper's stdout,
+		# and joining it first would deadlock NVDA (observed as a lockup when switching
+		# synthesizers). Killing the helper gives that read EOF.
+		for engine in list(self._engines.values()):
+			engine.kill()
 		self.bgThread.join()
-		self._stopEngine()
-		if self.player:
+		self._stopEngines()
+		for player in list(self._players.values()):
 			try:
-				self.player.close()
+				player.close()
 			except Exception:
 				pass
+		self._players.clear()
 
 	def cancel(self):
 		log.debug("BSTDBG cancel")
@@ -791,16 +991,13 @@ class SynthDriver(SynthDriver):
 				item = bgQueue.get_nowait()
 			except queue.Empty:
 				break
-		if self.player:
-			self.player.stop()
-		if self._use_helper and self._helper is not None:
-			# Send CANCEL command: text_len == 0
-			try:
-				with self._helperLock:
-					self._helper.stdin.write(struct.pack('<I', 0))
-					self._helper.stdin.flush()
-			except OSError:
-				pass
+		for player in list(self._players.values()):
+			player.stop()
+		# Any loaded engine could be the one mid-utterance; the cancel is cheap and a
+		# no-op for the idle ones.
+		for engine in list(self._engines.values()):
+			engine.cancel()
 
 	def pause(self, switch):
-		if self.player: self.player.pause(switch)
+		for player in list(self._players.values()):
+			player.pause(switch)
