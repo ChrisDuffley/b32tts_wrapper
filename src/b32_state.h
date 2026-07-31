@@ -38,6 +38,12 @@ struct bst_state {
 	v2InitFunc v2_init;
 	v2DeInitFunc v2_deinit;
 	v2SayFunc v2_say;
+	// Per-dll text limits, all in expansion-weighted characters (see the scan in
+	// bst_v2_speak). The builds differ: measured ceilings range from Hebrew's 41-char
+	// phrase budget to Dutch's 151+. Set by bst_v2_setup from the dll's filename.
+	int v2_chunk_limit;  // Longest text passed to one Say_TTS call.
+	int v2_phrase_limit; // Longest run without an honored phrase break (overflow is dropped or truncated silently).
+	int v2_token_limit;  // Longest run without any whitespace (Russian truncates these far earlier than its phrase limit).
 	int sample_rate; // The true output rate: what waveOutOpen declares for classic (11025), overridden to 10800 for v2 dlls (most misdeclare 10000; Russian's honest 10800 declaration and formant alignment against classic both identify the family's true rate).
 	float pending_rate_multiplier;
 	float bass_lp; // One pole lowpass state for the v2 tone correction shelf.

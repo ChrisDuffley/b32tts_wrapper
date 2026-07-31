@@ -92,6 +92,22 @@ profileParams = ("voice", "rate", "rateBoost", "pitch", "inflection", "volume", 
 languageDefaults = {"classic": {"volume": 85}}
 v2LanguageDefaults = {"volume": 100}
 
+# The v2 frontends convert wide text to narrow bytes through the system codepage and
+# then read those bytes against their DOS-era internal tables, so typographic
+# punctuation comes out as spelled letter names: a curly left quote (cp1252 0x93,
+# cp850 o-circumflex) is announced "O circumflex", a curly right quote "O diaeresis",
+# a low-9 quote "A diaeresis". Their plain ascii equivalents are handled silently, so
+# map the common typographic set down before text reaches a v2 engine. The right
+# single quote U+2019 is deliberately absent: the possessive regex in _buildRun needs
+# to see it, and the encode-time table already turns it into an apostrophe.
+_v2PunctTable = str.maketrans({
+	"“": '"', "”": '"', "„": '"', "‟": '"',
+	"«": '"', "»": '"', "‹": "'", "›": "'",
+	"‘": "'", "‚": "'", "‛": "'",
+	"…": ", ",
+	"‐": "-", "‑": "-", "‒": "-", "−": "-",
+})
+
 def _profilePath():
 	try:
 		import globalVars
@@ -809,6 +825,9 @@ class SynthDriver(SynthDriver):
 			# name at higher punctuation levels before text ever reaches us.
 			text = re.sub(r"(?<=\w)['’]s\b", "s", text)
 			text = re.sub(r"\s*[–—―]+\s*", ", ", text)
+			# Typographic quotes and friends; see _v2PunctTable for why these must
+			# not reach a v2 engine ("O diaeresis" announcements).
+			text = text.translate(_v2PunctTable)
 		if cmdMode == "none":
 			# These languages' frontends can't read digits (Japanese and Greek drop them
 			# entirely, Polish only spells them); convert numbers to words in Python.

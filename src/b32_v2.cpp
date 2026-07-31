@@ -28,6 +28,43 @@ static bool bst_v2_debug() {
 	return cached == 1;
 }
 
+// Text limits vary per build; all were measured by length ladders against each dll
+// (durations flatten at truncation, drop to zero at a whole-phrase drop, and the
+// process dies past the hard buffer end around 256). Values here sit safely under the
+// worst measured ceiling for each dll; everything is in the same expansion-weighted
+// characters the chunker's scan counts.
+// * phrase: most builds DROP a phrase-break-free stretch that overflows their phrase
+//   buffer. Plain-text ceilings: por 113-117, ita 119-123, spa 125-129, fre/gre/pol
+//   131-139, ger 141-149, dut 151-169, eng >=140 (content dependent; normalization
+//   can shorten the effective room, hence the margins).
+// * token: Russian resets its counter at spaces but truncates a single whitespace-free
+//   token past ~48 chars (and silently skips long Latin tokens entirely, cut or not).
+//   Hebrew's counter ignores spaces altogether - only punctuation resets it - and its
+//   budget is a tiny ~41 chars.
+// * chunk: Russian garbles the whole utterance past ~235 chars when commas are dense
+//   (other builds hold to ~250); Hebrew produces partial output past ~90 regardless of
+//   punctuation; Japanese truncates at ~9 SECONDS of synthesized audio, which no
+//   punctuation resets, so its calls must stay near 40 chars (~8s at neutral rate).
+static void bst_v2_limits(bst_state* s) {
+	s->v2_chunk_limit = 240;
+	s->v2_phrase_limit = 112;
+	s->v2_token_limit = 112;
+	wchar_t path[MAX_PATH];
+	if (!GetModuleFileNameW(s->dll, path, MAX_PATH)) return;
+	wchar_t* base = wcsrchr(path, L'\\');
+	base = base? base + 1 : path;
+	_wcslwr(base);
+	if (wcsncmp(base, L"dll_", 4) != 0) return;
+	const wchar_t* lang = base + 4;
+	if (!wcsncmp(lang, L"por", 3)) s->v2_phrase_limit = s->v2_token_limit = 94;
+	else if (!wcsncmp(lang, L"ita", 3)) s->v2_phrase_limit = s->v2_token_limit = 100;
+	else if (!wcsncmp(lang, L"spa", 3)) s->v2_phrase_limit = s->v2_token_limit = 104;
+	else if (!wcsncmp(lang, L"fre", 3) || !wcsncmp(lang, L"gre", 3) || !wcsncmp(lang, L"pol", 3)) s->v2_phrase_limit = s->v2_token_limit = 108;
+	else if (!wcsncmp(lang, L"rus", 3)) { s->v2_chunk_limit = 224; s->v2_token_limit = 40; }
+	else if (!wcsncmp(lang, L"heb", 3)) { s->v2_chunk_limit = 88; s->v2_phrase_limit = 34; s->v2_token_limit = 34; }
+	else if (!wcsncmp(lang, L"jpn", 3)) s->v2_chunk_limit = 40;
+}
+
 bool bst_v2_setup(bst_state* s) {
 	s->v2_init = (v2InitFunc)GetProcAddress(s->dll, "Init_TTS");
 	s->v2_deinit = (v2DeInitFunc)GetProcAddress(s->dll, "DeInit_TTS");
@@ -35,6 +72,7 @@ bool bst_v2_setup(bst_state* s) {
 	if (!s->v2_init || !s->v2_say) return false;
 	s->is_v2 = true;
 	s->sample_rate = 10000;
+	bst_v2_limits(s);
 	s->v2_init();
 	return true;
 }
@@ -46,16 +84,15 @@ bool bst_v2_setup(bst_state* s) {
 // (verified: identical audio before and after a commanded utterance), so the leading
 // command run is parsed off and re-applied to every chunk.
 //
-// They also have a fixed 128 byte PHRASE buffer: the frontend accumulates text between
+// They also have a fixed PHRASE buffer: the frontend accumulates text between
 // punctuation marks to shape prosody, and a punctuation-free stretch that overflows it
-// is dropped in its entirety without a sound (measured: 122 chars speaks, 133 is
-// silent). Mastodon handles and other long unpunctuated runs hit this constantly, and
-// a dot only counts as punctuation when whitespace follows it, so "user.example.com"
-// does not reset the counter. Chunk cuts are therefore also forced so that no chunk
-// contains a punctuation-free run longer than V2_PHRASE_LIMIT; the engine flushes its
-// phrase buffer at end of input, so a mid-sentence chunk end acts as a phrase break.
-#define V2_CHUNK_LIMIT 240
-#define V2_PHRASE_LIMIT 112 // measured ceiling is 122-127; margin without cutting more often than needed
+// is dropped in its entirety without a sound (or truncated, on the builds that are
+// merciful). Mastodon handles and other long unpunctuated runs hit this constantly,
+// and a dot only counts as punctuation when whitespace follows it, so
+// "user.example.com" does not reset the counter. Chunk cuts are therefore forced so
+// that no chunk contains a run longer than the dll's limits (see bst_v2_limits); the
+// engine flushes its phrase buffer at end of input, so a mid-sentence chunk end acts
+// as a phrase break.
 
 static bool bst_v2_is_break(wchar_t c) {
 	return c == L'.' || c == L'!' || c == L'?' || c == L'\n' || c == 0x3002 || c == 0xFF01 || c == 0xFF1F;
@@ -91,13 +128,16 @@ void bst_v2_speak(bst_state* s, const char* utf8_text) {
 	}
 	wchar_t* content = wtext + prefix_len;
 	int content_len = total - prefix_len;
-	int window = V2_CHUNK_LIMIT - prefix_len;
-	if (window < 40) window = 40; // degenerate prefix; better to risk a long chunk than emit confetti
+	int window = s->v2_chunk_limit - prefix_len;
+	// Degenerate prefix; better to risk a long chunk than emit confetti. Small-chunk
+	// builds (Japanese) get a lower floor so a command prefix can't defeat their limit.
+	int window_floor = s->v2_chunk_limit < 80? 24 : 40;
+	if (window < window_floor) window = window_floor;
 	// Note: no short-text fast path here. Even an utterance under the chunk limit must
 	// go through the loop so the phrase-limit scan below can split it; a 130-240 char
 	// stretch without honored punctuation (a URL glued to surrounding words, say)
 	// would otherwise reach the engine whole and get its first phrase silently dropped.
-	wchar_t* chunk = (wchar_t*)malloc((V2_CHUNK_LIMIT + window + 1) * sizeof(wchar_t));
+	wchar_t* chunk = (wchar_t*)malloc((prefix_len + window + 1) * sizeof(wchar_t));
 	if (!chunk) {
 		free(wtext);
 		return;
@@ -110,23 +150,35 @@ void bst_v2_speak(bst_state* s, const char* utf8_text) {
 		// engine's phrase buffer. The buffer holds NORMALIZED text, so characters are
 		// weighted by their expansion: a digit becomes a number word ("9" -> "nine",
 		// six digits of "973520" -> ~60 chars) and URL-ish symbols become words like
-		// "slash". Runs reset at honored phrase breaks; a cut lands at the last space
-		// or URL separator inside the overlong run (hard mid-word as a last resort).
+		// "slash". Two counters cover the builds' two behaviors: "run" resets only at
+		// honored phrase breaks (the drop-the-whole-phrase buffer most builds have),
+		// "token" also resets at whitespace (the per-word counter Russian truncates
+		// on). A phrase cut lands at the last space or URL separator inside the
+		// overlong run; a token by definition has none, so it's cut where it stands.
 		{
-			int run = 0, run_space = -1, forced = -1;
+			int run = 0, token = 0, run_space = -1, forced = -1;
 			for (int i = 0; i < take; i++) {
 				wchar_t c = content[pos + i];
 				if (bst_v2_phrase_break_at(content + pos, remain, i)) {
 					run = 0;
+					token = 0;
 					run_space = -1;
 					continue;
 				}
+				if (bst_v2_is_space(c)) token = 0;
 				if (bst_v2_is_space(c) || c == L'/' || c == L'-' || c == L'_') run_space = i;
-				if (c >= L'0' && c <= L'9') run += 10;
-				else if (c == L'/' || c == L'-' || c == L'_' || c == L':' || c == L'@' || c == L'%' || c == L'#' || c == L'&' || c == L'+' || c == L'=' || c == L'.') run += 6;
-				else run++;
-				if (run >= V2_PHRASE_LIMIT) {
+				int w;
+				if (c >= L'0' && c <= L'9') w = 10;
+				else if (c == L'/' || c == L'-' || c == L'_' || c == L':' || c == L'@' || c == L'%' || c == L'#' || c == L'&' || c == L'+' || c == L'=' || c == L'.') w = 6;
+				else w = 1;
+				run += w;
+				if (!bst_v2_is_space(c)) token += w;
+				if (run >= s->v2_phrase_limit) {
 					forced = run_space > 0? run_space + 1 : i;
+					break;
+				}
+				if (token >= s->v2_token_limit) {
+					forced = i;
 					break;
 				}
 			}
