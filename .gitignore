@@ -10,4 +10,5 @@ output
 *.pdb
 *.wav
 !bin/b32_tts.dll
+!bin/dll_*.dll
 !bin/MinHook.lib

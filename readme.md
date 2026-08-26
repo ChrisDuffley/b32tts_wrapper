@@ -9,6 +9,27 @@ This project negates the aformentioned issue by actually hooking the waveOut fun
 
 Bestspeech outputs audio in 16 bit 11025hz mono pcm.
 
+## Language support
+
+In addition to the classic 1994 b32_tts.dll, the wrapper can load the stripped down 2006 "v2" builds of BeSTspeech which shipped with Lingvosoft Talking Dictionary products and were preserved by Rommix. These come as one dll per language (dll_eng.dll, dll_fre.dll, dll_ger.dll, dll_spa.dll, dll_ita.dll, dll_por.dll, dll_dut.dll, dll_pol.dll, dll_rus.dll, dll_gre.dll, dll_heb.dll, dll_ara.dll, dll_jpn.dll) and accept unicode text, which is what makes the non Latin scripts work. The wrapper detects which flavor of dll it was given from the dll's exports, so you simply pass a v2 dll path to bst_init where you'd normally pass b32_tts.dll.
+
+A few things to be aware of with the v2 dlls:
+
+* Text passed to the speak functions is interpreted as utf-8 for v2 dlls, unlike the classic engine which takes windows-1252 bytes verbatim.
+* Most v2 dlls declare a 10000hz output format, which renders their voices audibly deep and chesty; playing them at the classic engine's 11025hz overshoots into chipmunk instead. The family's true rate is 10800hz: formant envelope alignment against the classic engine peaks there, and the Russian dll is the one build that actually declares it. The wrapper therefore plays all v2 output at 10800hz; bst_get_sample_rate, generated wav headers and the NVDA addon all follow.
+* There is no parameter interface in these builds, but most of the language frontends still understand the inline tilde commands (~r rate, ~f pitch, ~g gain, ~u unvoiced gain and ~e excitation including whisper all work), which is how the wrapper and the NVDA addon apply settings to them. The ~v headsize and ~h inflection commands are ignored by all v2 dlls (verified empirically: any value produces byte identical audio), so the NVDA addon hides those two sliders while a v2 language is active.
+* Three language builds are special, established by byte comparing and whisper-transcribing their output: Polish reads tilde commands aloud as text, Japanese vocalizes a short artifact per command while applying no effect, and Greek strips commands together with all other non-Greek text (it only speaks Greek script). For these three the NVDA addon sends plain text only, realizes the rate setting through the bundled sonic time stretcher and volume through the audio player, and hides the settings that can't work. Arabic's dll is a stub that only ever emits silence, so it isn't offered at all.
+* The v2 dlls have a quirk where after synthesizing an utterance they blindly sleep for the audio's entire real time duration. The wrapper hooks Sleep and skips that nap on the synthesis thread, so speaking through them is just as instant as the classic engine.
+* Every build has fixed internal text buffers and the sizes differ per language, so the wrapper chunks text with per-dll limits (see bst_v2_limits in b32_v2.cpp). Three failure shapes were measured: overflowing the ~256 byte text buffer crashes outright; a phrase-break-free stretch that overflows the phrase buffer is dropped entirely and silently, with plain-text ceilings ranging from Hebrew's ~41 chars (spaces don't reset its counter, only punctuation does) through Portuguese's ~115 up to Dutch's ~160; and some builds truncate instead of dropping - Russian caps any whitespace-free token near 48 chars (and skips long Latin tokens entirely no matter what), while Japanese stops synthesizing at roughly nine seconds of audio per call, which no punctuation resets, so it is chunked near 40 chars. The phrase buffers hold normalized text, so digits and URL symbols count several times their length. Russian additionally garbles whole utterances past ~235 chars when commas are dense, and Hebrew degrades past ~90 chars regardless of punctuation; their chunk limits are lowered to match.
+* Each Say_TTS call is synthesized into a fixed audio buffer (~512kb, about 24 seconds for English) which WRAPS when the utterance outgrows it - the beginning of the audio silently vanishes and only the tail plays. Comma-delimited digit lists are dense enough in audio to hit this within the text limits, and slow ~r rates stretch anything toward it, so the chunker also budgets each chunk's predicted audio, scaled by the ~r value it finds in the chunk's command prefix.
+* The v2 frontends convert wide text to narrow bytes through the system codepage and read them against DOS-era tables, so typographic punctuation is announced as letter names (a curly left quote becomes "O circumflex", a right one "O diaeresis"). The NVDA addon maps curly quotes, guillemets, ellipses and typographic hyphens to their plain ascii equivalents, which the engines handle silently.
+
+The command line utility grew a matching -d switch to select the engine dll, for example ```b32_spk -dC:\path\to\dll_ger.dll -t"Guten Tag!" -fout.wav```
+
+The NVDA addon exposes all of this as a Language combo box in the synthesizer settings dialog. Copy any v2 language dlls you have into the addon's synthDrivers folder (next to b32_tts.dll) and they will appear in the list alongside Classic English, which remains the default. Voices, rate boost and the other settings work on every language.
+
+The addon also supports NVDA's automatic language switching. With it enabled in NVDA's speech settings, a stretch of text marked as being in another language is spoken by that language's dll and the rest of the sentence continues on the one you selected, so a French quotation in an English document is read in French. There is one dll per language, so dialects fall back to their base language (en-GB and en-US are both just English) and languages with no dll present stay on your selected language; NVDA reports those as unsupported if you have asked it to. Because the switch happens mid utterance, an engine is kept loaded for each language that gets spoken rather than being reloaded on every switch, and the classic engine's 11025hz output and the v2 dlls' 10800hz each get their own audio player. The v2 dlls are about 12db quieter than the classic engine, which is why they default to a higher volume; that same offset is applied to a switched-to stretch so the sentence doesn't change loudness half way through.
+
 ## How to build?
 This project uses the SCons build system. If you have scons and a c++ compiler installed and on your path, you can just run scons -s in the root of this project to generate a .dll wrapper, a test program and a statically linked high level command line utility. Prebuilt binaries are provided on the releases page, or you can fork the repository and run the build action.
 
@@ -65,6 +86,16 @@ This version of the speak function allows your application to receive audio data
 ```void bst_speech_free(char* data);```
 
 Call this to free any data returned by bst_speak. Do not use this within the context of bst_speak_async.
+
+
+```int bst_get_sample_rate(bst_state* s);```
+
+Returns the engine's output sample rate in hz: 11025 for the classic engine, 10800 for the v2 language dlls (by deliberate override of the misdeclared 10000hz formats most of them report; see the language support section).
+
+
+```bool bst_is_v2(bst_state* s);```
+
+Returns true if the loaded dll is a 2006 v2 language dll rather than the classic engine.
 
 
 ## Notes

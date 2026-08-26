@@ -6,7 +6,7 @@
 #include "b32_wrapper.h"
 
 int main(int argc, const char** argv) {
-	const char *voice = nullptr, *text = nullptr, *outpath = nullptr;
+	const char *voice = nullptr, *text = nullptr, *outpath = nullptr, *dll = "b32_tts.dll";
 	int rate = 0;
 	const char* const usages[] = {"b32_spk [options]", nullptr};
 	argparse_option options[] = {
@@ -15,6 +15,7 @@ int main(int argc, const char** argv) {
 		OPT_STRING('v', "voice", &voice, "voice to speak with (? to list)", nullptr, 0, 0),
 		OPT_STRING('t', "text", &text, "text to speak", nullptr, 0, 0),
 		OPT_INTEGER('r', "rate", &rate, "speech rate", nullptr, 0, 0),
+		OPT_STRING('d', "dll", &dll, "engine dll to load (b32_tts.dll or a v2 language dll like dll_eng.dll; utf-8 text expected for the latter)", nullptr, 0, 0),
 		OPT_END()
 	};
 	argparse argparse;
@@ -40,7 +41,7 @@ int main(int argc, const char** argv) {
 		printf("No text provided, run b32_spk -h for help\n");
 		return 1;
 	}
-	bst_state* tts = bst_init();
+	bst_state* tts = bst_init(dll);
 	if (!tts) {
 		printf("error initializing text to speech system\n");
 		return 1;

@@ -1,16 +1,24 @@
 // b32_helper.cpp
 // 32-bit out-of-process TTS helper, used by the NVDA addon when running under
-// 64-bit NVDA (2026+). Launched as a subprocess with the b32_tts.dll path as
-// its sole command-line argument.
+// 64-bit NVDA (2026+). Launched as a subprocess with the engine dll path as
+// its sole command-line argument. That dll can be the classic b32_tts.dll or
+// one of the 2006 v2 language dlls (dll_eng.dll, dll_rus.dll, ...); the
+// wrapper detects the flavor from the dll's exports.
 //
 // === stdin protocol (binary, little-endian) ===
-//   SPEAK command  : [uint32 text_len (> 0)] [float32 rate_mult] [text_len bytes, windows-1252]
+//   SPEAK command  : [uint32 text_len (> 0)] [float32 rate_mult] [text_len bytes]
+//                    Text bytes are windows-1252 for the classic engine and
+//                    utf-8 for v2 language dlls.
 //   CANCEL command : [uint32 = 0]
 //   QUIT command   : [uint32 = 0xFFFFFFFF]
 //   EOF on stdin is treated the same as QUIT.
 //
 // === stdout protocol (binary, little-endian) ===
-//   Audio chunk    : [uint32 chunk_len (> 0)] [chunk_len bytes raw 16-bit mono PCM @ 11025 Hz]
+//   Handshake      : [uint32 = 0xFFFFFFFE] [uint32 sample_rate_hz]
+//   Emitted exactly once at startup, before any audio, after a short warmup
+//   synthesis that teaches us the engine's true output rate (classic is
+//   11025, v2 dlls vary per language).
+//   Audio chunk    : [uint32 chunk_len (> 0)] [chunk_len bytes raw 16-bit mono PCM]
 //   End-of-utter.  : [uint32 = 0]
 //   One end-of-utterance sentinel is emitted after every SPEAK command
 //   (whether it completed normally or was cancelled).
@@ -50,6 +58,9 @@ static HANDLE            g_cmd_event;
 static bool audio_cb(char* data, long size, void* /*user*/)
 {
     if (g_cancel) return false;
+    // A zero length chunk on stdout means end-of-utterance to our parent; never let
+    // an empty audio block (e.g. from sonic buffering) masquerade as that sentinel.
+    if (size <= 0) return true;
 
     uint32_t len = (uint32_t)size;
     if (fwrite(&len, sizeof(uint32_t), 1, stdout) != 1) return false;
@@ -144,6 +155,18 @@ int main(int argc, const char** argv)
 
     bst_state* state = bst_init(dll_path);
     if (!state) return 1;
+
+    // Warmup: synthesize a token utterance and throw it away so the wrapper
+    // learns the engine's true output sample rate, then hand that rate to our
+    // parent so it can configure its audio player before the first real
+    // utterance. This is near instant, even for v2 dlls (their fake playback
+    // nap is skipped by the wrapper's Sleep hook).
+    long warmup_size = 0;
+    char* warmup = bst_speak(state, &warmup_size, "a", -1, 0, 1.0f, 0, false);
+    bst_speech_free(warmup);
+    uint32_t handshake[2] = { 0xFFFFFFFEu, (uint32_t)bst_get_sample_rate(state) };
+    fwrite(handshake, sizeof(uint32_t), 2, stdout);
+    fflush(stdout);
 
     InitializeCriticalSection(&g_pending_cs);
     g_cmd_event = CreateEvent(NULL, /*manualReset=*/FALSE, /*initial=*/FALSE, NULL);
