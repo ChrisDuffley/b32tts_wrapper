@@ -65,6 +65,55 @@ static void bst_v2_limits(bst_state* s) {
 	else if (!wcsncmp(lang, L"jpn", 3)) s->v2_chunk_limit = 40;
 }
 
+// On top of the text-side limits, the engines synthesize each Say_TTS call into a
+// fixed audio buffer (~512kb, about 24 seconds at 10800hz for English) and WRAP when
+// the utterance's audio outgrows it: the single waveOutWrite then delivers only the
+// remainder past the last wrap point, so the utterance's BEGINNING silently vanishes.
+// Reproduced with a comma-delimited number list ("1, 2, 3, ... 34"): at ~r0 only the
+// tail from "31" survives, at ~r55 it starts at "23", while at ~r-29 (faster, so
+// under 24s of audio) it speaks completely. Digit lists are audio dense (~0.85s per
+// "31, ") and slow rates stretch everything, which is how a chunk that respects every
+// text limit can still overflow the ring. The chunker therefore also budgets each
+// chunk's PREDICTED AUDIO, scaling by the engine's ~r rate parsed from the chunk
+// prefix, using the same measured speed curve the NVDA driver uses for sonic.
+static const struct { int r; float speed; } bst_v2_rate_curve[] = {
+	{ 200, 0.371f }, { 100, 0.539f }, { 0, 1.0f }, { -45, 1.660f }, { -61, 2.113f }, { -90, 2.711f }
+};
+
+static float bst_v2_rate_speed(int r) {
+	const int n = sizeof(bst_v2_rate_curve) / sizeof(bst_v2_rate_curve[0]);
+	if (r >= bst_v2_rate_curve[0].r) return bst_v2_rate_curve[0].speed;
+	if (r <= bst_v2_rate_curve[n - 1].r) return bst_v2_rate_curve[n - 1].speed;
+	for (int i = 0; i < n - 1; i++) {
+		int r1 = bst_v2_rate_curve[i].r, r2 = bst_v2_rate_curve[i + 1].r;
+		if (r <= r1 && r >= r2) {
+			float s1 = bst_v2_rate_curve[i].speed, s2 = bst_v2_rate_curve[i + 1].speed;
+			return s1 + (s2 - s1) * (float)(r1 - r) / (float)(r1 - r2);
+		}
+	}
+	return 1.0f;
+}
+
+// Weighted characters allowed per chunk before its audio risks the ring. 260 keeps
+// plain prose at neutral rate (240-char chunks, ~20s) uncut, while digit-heavy text
+// (weighted several times its raw length, like its audio) is cut far earlier, and a
+// slow ~r shrinks the budget in proportion to how much longer it makes the audio.
+#define V2_AUDIO_BUDGET_BASE 260
+
+static int bst_v2_audio_budget(const wchar_t* prefix, int prefix_len) {
+	int r = 0;
+	for (int i = 0; i + 1 < prefix_len; i++) {
+		if (prefix[i] != L'~' || prefix[i + 1] != L'r') continue;
+		int j = i + 2, sign = 1, val = 0;
+		if (j < prefix_len && prefix[j] == L'-') { sign = -1; j++; }
+		bool digits = false;
+		while (j < prefix_len && prefix[j] >= L'0' && prefix[j] <= L'9') { val = val * 10 + (prefix[j] - L'0'); j++; digits = true; }
+		if (digits && j < prefix_len && prefix[j] == L']') { r = sign * val; break; }
+	}
+	int budget = (int)(V2_AUDIO_BUDGET_BASE * bst_v2_rate_speed(r));
+	return budget < 48? 48 : budget;
+}
+
 bool bst_v2_setup(bst_state* s) {
 	s->v2_init = (v2InitFunc)GetProcAddress(s->dll, "Init_TTS");
 	s->v2_deinit = (v2DeInitFunc)GetProcAddress(s->dll, "DeInit_TTS");
@@ -142,6 +191,7 @@ void bst_v2_speak(bst_state* s, const char* utf8_text) {
 		free(wtext);
 		return;
 	}
+	int audio_budget = bst_v2_audio_budget(wtext, prefix_len);
 	int pos = 0;
 	while (pos < content_len && !s->async_stop_speaking) {
 		int remain = content_len - pos;
@@ -156,13 +206,19 @@ void bst_v2_speak(bst_state* s, const char* utf8_text) {
 		// on). A phrase cut lands at the last space or URL separator inside the
 		// overlong run; a token by definition has none, so it's cut where it stands.
 		{
-			int run = 0, token = 0, run_space = -1, forced = -1;
+			int run = 0, token = 0, total = 0, run_space = -1, last_break = -1, forced = -1;
 			for (int i = 0; i < take; i++) {
 				wchar_t c = content[pos + i];
 				if (bst_v2_phrase_break_at(content + pos, remain, i)) {
 					run = 0;
 					token = 0;
 					run_space = -1;
+					last_break = i;
+					total++;
+					if (total >= audio_budget) {
+						forced = i + 1;
+						break;
+					}
 					continue;
 				}
 				if (bst_v2_is_space(c)) token = 0;
@@ -172,6 +228,7 @@ void bst_v2_speak(bst_state* s, const char* utf8_text) {
 				else if (c == L'/' || c == L'-' || c == L'_' || c == L':' || c == L'@' || c == L'%' || c == L'#' || c == L'&' || c == L'+' || c == L'=' || c == L'.') w = 6;
 				else w = 1;
 				run += w;
+				total += w;
 				if (!bst_v2_is_space(c)) token += w;
 				if (run >= s->v2_phrase_limit) {
 					forced = run_space > 0? run_space + 1 : i;
@@ -179,6 +236,12 @@ void bst_v2_speak(bst_state* s, const char* utf8_text) {
 				}
 				if (token >= s->v2_token_limit) {
 					forced = i;
+					break;
+				}
+				// Audio-budget overflow prefers a cut right after the last honored
+				// break (a comma boundary sounds intended), then the last space.
+				if (total >= audio_budget) {
+					forced = last_break >= 0? last_break + 1 : (run_space > 0? run_space + 1 : i);
 					break;
 				}
 			}
